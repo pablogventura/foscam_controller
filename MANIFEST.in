@@ -1,0 +1,8 @@
+# Incluir lo necesario para el paquete
+include README.md pyproject.toml
+recursive-include foscam *.py
+recursive-include scripts *.sh
+
+# Excluir repos de referencia (no publicar en PyPI)
+prune foscam_control_repo
+prune configurador_foscam_repo

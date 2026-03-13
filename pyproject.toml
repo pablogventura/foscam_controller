@@ -1,0 +1,45 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "foscam-controller"
+version = "0.1.0"
+description = "Herramientas unificadas para gestionar cámaras Foscam: descubrir, configurar, visor y consola CGI"
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.7"
+authors = [
+  { name = "Pablo Ventura" }
+]
+keywords = ["foscam", "ip-camera", "cgi", "ptz", "rtsp"]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Environment :: Console",
+  "Intended Audience :: End Users/Desktop",
+  "License :: OSI Approved :: MIT License",
+  "Operating System :: OS Independent",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.7",
+  "Programming Language :: Python :: 3.8",
+  "Programming Language :: Python :: 3.9",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Topic :: Multimedia :: Video :: Capture",
+]
+dependencies = [
+  "requests>=2.31.0",
+  "opencv-python>=4.8.0",
+  "Pillow>=10.0.0",
+  "av>=10.0.0",
+  "sounddevice>=0.4.6",
+  "numpy>=1.20.0",
+]
+
+[project.scripts]
+foscam = "foscam.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["foscam*"]
