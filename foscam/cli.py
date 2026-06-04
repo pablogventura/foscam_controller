@@ -55,6 +55,8 @@ def cmd_view(args) -> None:
         sys.argv.append("--sub")
     if getattr(args, "nvidia", False):
         sys.argv.append("--nvidia")
+    if getattr(args, "audio_gate_db", None) is not None:
+        sys.argv.extend(["--audio-gate-db", str(args.audio_gate_db)])
     viewer_main()
 
 
@@ -119,6 +121,13 @@ Ejemplos:
     p_view.add_argument("--port", type=int, default=88, help="Puerto (default: 88)")
     p_view.add_argument("--sub", action="store_true", help="Usar sub stream (menor resolución)")
     p_view.add_argument("--nvidia", action="store_true", help="Decodificación GPU NVIDIA")
+    p_view.add_argument(
+        "--audio-gate-db",
+        type=float,
+        default=None,
+        metavar="dB",
+        help="Puerta de ruido en dB (por defecto: valor guardado o -38)",
+    )
     p_view.set_defaults(func=cmd_view)
 
     # console

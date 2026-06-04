@@ -94,8 +94,22 @@ foscam apply --ip 192.168.1.7 --user admin --password xxx --file cam.json
 ### Visor en vivo
 
 ```bash
-foscam view --ip 192.168.1.6 --user admin --password xxx [--port 88] [--sub] [--nvidia]
+foscam view --ip 192.168.1.6 --user admin --password xxx [--port 88] [--sub] [--nvidia] [--audio-gate-db -38]
 ```
+
+Panel lateral derecho en la ventana del visor:
+
+| Control | Descripción |
+|---------|-------------|
+| Volumen | Slider 0–100 (también teclas `a` / `z`) |
+| Puerta audio (dB) | Umbral de ruido: solo se oye por encima de este nivel (`--audio-gate-db` por CLI, ajustable en vivo) |
+| Nivel audio | Barra del nivel entrante en dB (requiere ruta PyAV con audio) |
+| Movimiento (imagen) | Cambio entre frames en el video |
+| Alarma cámara | Estado vía CGI (`getDevState`, etc.); puede mostrar N/D según modelo |
+
+La **línea roja** sobre la barra de nivel audio marca el umbral de la puerta (gate). Volumen y puerta se recuerdan en `~/.config/foscam-controller/viewer.json`.
+
+Con ruta **ffplay** (sin PyAV en el stream principal), si está instalado `av`, un demux auxiliar alimenta la barra de nivel de audio.
 
 Atajos en el visor:
 
@@ -104,7 +118,7 @@ Atajos en el visor:
 | Flechas   | Mover PTZ (mantener/soltar)|
 | 0         | Ir al preset por defecto   |
 | a / z     | Subir / bajar volumen      |
-| Snapshot  | Guardar captura            |
+| Captura   | Guardar captura            |
 
 Ejecutar el visor como módulo (sin usar el CLI):
 
