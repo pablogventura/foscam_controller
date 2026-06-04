@@ -10,6 +10,7 @@ dist/
 build/
 *.json
 !package.json
+!foscam/ui/assets/theme_pool.json
 config_*.json
 *_config.json
 snapshot_*.jpg
