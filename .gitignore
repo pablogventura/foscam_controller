@@ -1,4 +1,6 @@
 venv/
+.venv/
+.cursor/
 __pycache__/
 *.pyc
 *.pyo
