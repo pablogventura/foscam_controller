@@ -6,7 +6,9 @@ Takes connection parameters from command line arguments.
 """
 
 import tkinter as tk
-from tkinter import ttk, messagebox
+from tkinter import messagebox
+
+import customtkinter as ctk
 import cv2
 from PIL import Image, ImageTk
 import threading
@@ -27,6 +29,8 @@ from urllib.parse import urlencode, quote
 import xml.etree.ElementTree as ET
 
 from foscam.client import FoscamClient
+from foscam.ui.shell import ViewerShell
+from foscam.ui import theme as ui_theme
 
 # Audio: PyAV + sounddevice (un solo demux, sync vídeo/audio) o ffplay como fallback
 try:
@@ -42,16 +46,16 @@ except (ImportError, OSError):
 PYAV_AUDIO_AVAILABLE = _PYAV_OK
 AUDIO_AVAILABLE = PYAV_AUDIO_AVAILABLE or (shutil.which("ffplay") is not None)
 
-SIDEBAR_WIDTH = 210
 MOTION_FRAME_SIZE = (160, 120)
 METER_EMA_ALPHA = 0.25
 AUDIO_DB_FLOOR = -60.0
 AUDIO_DB_CEIL = 0.0
 GATE_SLIDER_MIN = -90
 GATE_SLIDER_MAX = -20
+GATE_PRESETS = {"Llanto": -38.0, "Suave": -48.0, "Off": -90.0}
 VIEWER_PREFS_PATH = Path.home() / ".config" / "foscam-controller" / "viewer.json"
-AUDIO_METER_CANVAS_W = 180
-AUDIO_METER_CANVAS_H = 14
+DISPLAY_INTERVAL_MS = 33  # ~30 FPS UI; menos carga que 20 ms con CTkImage
+DISPLAY_DETAIL_EVERY_N = 15  # actualizar panel técnico cada N frames mostrados
 
 
 def _load_viewer_prefs():
@@ -66,15 +70,34 @@ def _load_viewer_prefs():
     return {}
 
 
-def _save_viewer_prefs(volume, audio_gate_db):
+def _save_viewer_prefs(
+    volume, audio_gate_db, geometry=None, muted=None, volume_before_mute=None, ui_scale=None,
+):
     try:
         VIEWER_PREFS_PATH.parent.mkdir(parents=True, exist_ok=True)
+        data = {
+            "volume": int(volume),
+            "audio_gate_db": float(audio_gate_db),
+        }
+        if geometry:
+            data["geometry"] = str(geometry)
+        if muted is not None:
+            data["muted"] = bool(muted)
+        if volume_before_mute is not None:
+            data["volume_before_mute"] = int(volume_before_mute)
+        if ui_scale is not None:
+            data["ui_scale"] = float(ui_scale)
+        try:
+            if VIEWER_PREFS_PATH.is_file():
+                with open(VIEWER_PREFS_PATH, encoding="utf-8") as f:
+                    existing = json.load(f)
+                if isinstance(existing, dict):
+                    existing.update(data)
+                    data = existing
+        except (OSError, json.JSONDecodeError, TypeError):
+            pass
         with open(VIEWER_PREFS_PATH, "w", encoding="utf-8") as f:
-            json.dump(
-                {"volume": int(volume), "audio_gate_db": float(audio_gate_db)},
-                f,
-                indent=2,
-            )
+            json.dump(data, f, indent=2)
     except OSError:
         pass
 
@@ -85,13 +108,30 @@ class FoscamViewer:
     def __init__(
         self, root, ip, port, user, password,
         use_sub_stream=False, audio_gate_db=None, use_nvidia_decode=False,
-        initial_volume=None,
+        initial_volume=None, ui_scale=None,
     ):
         prefs = _load_viewer_prefs()
+        self.ui_scale = float(
+            ui_scale if ui_scale is not None
+            else prefs.get("ui_scale", ui_theme.DEFAULT_UI_SCALE)
+        )
         self.root = root
         self.camera_name = None  # Fetched from camera after connection
         self.root.title(f"Visor Foscam - {ip}:{port}")
-        self.root.geometry("1180x768")
+        geom = prefs.get("geometry") or ui_theme.default_window_geometry(self.ui_scale)
+        try:
+            self.root.geometry(str(geom))
+        except tk.TclError:
+            self.root.geometry(ui_theme.default_window_geometry(self.ui_scale))
+        self._muted = bool(prefs.get("muted", False))
+        saved_vol = int(prefs.get("volume", 50))
+        self._volume_before_mute = int(prefs.get("volume_before_mute", saved_vol if saved_vol > 0 else 50))
+        self._fullscreen = False
+        self._video_photo = None
+        self._last_image_size = None
+        self._display_frame_count = 0
+        self._geom_save_after_id = None
+        self.root.bind("<Configure>", self._on_root_configure)
         
         # Camera connection parameters (from command line)
         self.camera_ip = ip
@@ -141,6 +181,10 @@ class FoscamViewer:
         else:
             self._playback_volume = int(prefs.get("volume", 50))
         self._playback_volume = max(0, min(100, self._playback_volume))
+        if self._muted:
+            if saved_vol > 0:
+                self._volume_before_mute = saved_vol
+            self._playback_volume = 0
         self._audio_restart_in_progress = False
         self._gate_restart_after_id = None
         self._prefs_save_after_id = None
@@ -184,146 +228,214 @@ class FoscamViewer:
         if self.use_nvidia_decode:
             parts.append("--nvidia")
         return "  |  ".join(parts)
-    
-    def _create_widgets(self):
-        """Create GUI widgets."""
-        # Status bar first so it stays fixed at bottom (pack order matters)
-        status_frame = ttk.Frame(self.root)
-        status_frame.pack(side=tk.BOTTOM, fill=tk.X)
-        self.status_var = tk.StringVar(value=f"Conectando a {self.camera_ip}:{self.camera_port}...")
-        self.resolution_var = tk.StringVar(value="")
-        self.display_size_var = tk.StringVar(value="")
-        self.decode_backend_var = tk.StringVar(value="")  # "NVIDIA" o "" cuando hay decodificación por GPU
-        self.volume_var = tk.StringVar(value="Vol: --")  # Volumen de audio de la cámara (a/z)
-        res_label = ttk.Label(status_frame, textvariable=self.resolution_var, relief=tk.SUNKEN, anchor=tk.E, width=12)
-        res_label.pack(side=tk.RIGHT, padx=(4, 0))
-        disp_label = ttk.Label(status_frame, textvariable=self.display_size_var, relief=tk.SUNKEN, anchor=tk.E, width=14)
-        disp_label.pack(side=tk.RIGHT, padx=(4, 0))
-        decode_label = ttk.Label(status_frame, textvariable=self.decode_backend_var, relief=tk.SUNKEN, anchor=tk.E, width=9)
-        decode_label.pack(side=tk.RIGHT, padx=(4, 0))
-        vol_label = ttk.Label(status_frame, textvariable=self.volume_var, relief=tk.SUNKEN, anchor=tk.E, width=8)
-        vol_label.pack(side=tk.RIGHT, padx=(4, 0))
-        ttk.Label(status_frame, textvariable=self.status_var, relief=tk.SUNKEN, anchor=tk.W).pack(side=tk.LEFT, fill=tk.X, expand=True)
 
-        # Top frame for controls
-        control_frame = ttk.Frame(self.root, padding="10")
-        control_frame.pack(side=tk.TOP, fill=tk.X)
-        
-        # Fila 1: camera info + botones
-        row1 = ttk.Frame(control_frame)
-        row1.pack(side=tk.TOP, fill=tk.X)
-        self.info_var = tk.StringVar(
-            value=f"Cámara: {self.camera_ip}:{self.camera_port} | Usuario: {self.camera_user}"
+    def _create_widgets(self):
+        """Create GUI via CustomTkinter shell."""
+        host = f"{self.camera_ip}:{self.camera_port}"
+        self.ui = ViewerShell(self.root, host=host)
+        self.ui.build(
+            initial_volume=self._playback_volume,
+            gate_db=self.audio_gate_db,
+            gate_min=GATE_SLIDER_MIN,
+            gate_max=GATE_SLIDER_MAX,
+            params_display=self._build_params_display(),
+            on_snapshot=self._take_snapshot,
+            on_disconnect=self._disconnect_camera,
+            on_mute_toggle=self._toggle_mute,
+            on_volume_change=self._on_volume_slider,
+            on_gate_change=self._on_gate_slider,
+            on_gate_preset=self._apply_gate_preset,
+            on_display_resize=self._on_display_resize,
+            on_ptz_move=self._ptz_move,
+            on_ptz_stop=self._ptz_stop,
+            on_toggle_details=self._toggle_details_panel,
+            on_toggle_help=self._toggle_help_panel,
         )
-        ttk.Label(row1, textvariable=self.info_var).pack(side=tk.LEFT, padx=5)
-        self.disconnect_btn = ttk.Button(row1, text="Desconectar", command=self._disconnect_camera)
-        self.disconnect_btn.pack(side=tk.RIGHT, padx=5)
-        self.snapshot_btn = ttk.Button(row1, text="Captura", command=self._take_snapshot)
-        self.snapshot_btn.pack(side=tk.RIGHT, padx=5)
-        
-        # Fila 2: todos los parámetros de consola (contraseña enmascarada)
-        self._params_var = tk.StringVar(value=self._build_params_display())
-        params_label = ttk.Label(control_frame, textvariable=self._params_var, font=("TkDefaultFont", 8))
-        params_label.pack(side=tk.TOP, anchor=tk.W, padx=5, pady=(2, 0))
-        
-        # Área principal: video (izq) + sidebar medidores (der)
-        content_frame = ttk.Frame(self.root)
-        content_frame.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
-        
-        video_frame = ttk.Frame(content_frame, padding="10")
-        video_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        self.video_label = ttk.Label(video_frame, text="Conectando...", anchor=tk.CENTER)
-        self.video_label.pack(fill=tk.BOTH, expand=True)
-        self.video_label.bind("<Configure>", self._on_display_resize)
-        
-        sidebar = ttk.Frame(content_frame, padding="8", width=SIDEBAR_WIDTH)
-        sidebar.pack(side=tk.RIGHT, fill=tk.Y)
-        sidebar.pack_propagate(False)
-        
-        ttk.Label(sidebar, text="Volumen").pack(anchor=tk.W)
-        self._vol_var = tk.DoubleVar(value=self._playback_volume)
-        vol_scale = ttk.Scale(
-            sidebar, from_=0, to=100, orient=tk.HORIZONTAL,
-            variable=self._vol_var, command=self._on_volume_slider,
-        )
-        vol_scale.pack(fill=tk.X, pady=(0, 8))
-        self._vol_label_var = tk.StringVar(value=f"{int(self._playback_volume)} %")
-        ttk.Label(sidebar, textvariable=self._vol_label_var, font=("TkDefaultFont", 8)).pack(anchor=tk.W)
-        
-        ttk.Separator(sidebar, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=6)
-        ttk.Label(sidebar, text="Puerta audio (dB)").pack(anchor=tk.W)
-        self._gate_var = tk.DoubleVar(value=self.audio_gate_db)
-        gate_scale = ttk.Scale(
-            sidebar, from_=GATE_SLIDER_MIN, to=GATE_SLIDER_MAX, orient=tk.HORIZONTAL,
-            variable=self._gate_var, command=self._on_gate_slider,
-        )
-        gate_scale.pack(fill=tk.X, pady=(0, 4))
-        self._gate_label_var = tk.StringVar(value=f"{self.audio_gate_db:.0f} dB")
-        ttk.Label(sidebar, textvariable=self._gate_label_var, font=("TkDefaultFont", 8)).pack(anchor=tk.W)
-        
-        ttk.Separator(sidebar, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=6)
-        ttk.Label(sidebar, text="Nivel audio").pack(anchor=tk.W)
-        audio_meter_box = ttk.Frame(sidebar)
-        audio_meter_box.pack(fill=tk.X, pady=(2, 0))
-        self._audio_meter_canvas = tk.Canvas(
-            audio_meter_box,
-            width=AUDIO_METER_CANVAS_W,
-            height=AUDIO_METER_CANVAS_H,
-            bg="#e0e0e0",
-            highlightthickness=0,
-        )
-        self._audio_meter_canvas.pack(fill=tk.X)
-        self._audio_meter = ttk.Progressbar(
-            audio_meter_box, length=AUDIO_METER_CANVAS_W, maximum=100, mode="determinate",
-        )
-        self._audio_meter.pack(fill=tk.X, pady=(2, 0))
-        self._audio_level_label_var = tk.StringVar(value="— dB")
-        ttk.Label(sidebar, textvariable=self._audio_level_label_var, font=("TkDefaultFont", 8)).pack(anchor=tk.W)
-        ttk.Label(
-            sidebar, text="Línea = umbral puerta", font=("TkDefaultFont", 7), foreground="#666",
-        ).pack(anchor=tk.W)
-        
-        ttk.Separator(sidebar, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=6)
-        ttk.Label(sidebar, text="Movimiento (imagen)").pack(anchor=tk.W)
-        self._motion_meter = ttk.Progressbar(sidebar, length=180, maximum=100, mode="determinate")
-        self._motion_meter.pack(fill=tk.X, pady=2)
-        
-        ttk.Separator(sidebar, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=6)
-        ttk.Label(sidebar, text="Alarma cámara").pack(anchor=tk.W)
-        self._camera_alarm_meter = ttk.Progressbar(sidebar, length=180, maximum=100, mode="determinate")
-        self._camera_alarm_meter.pack(fill=tk.X, pady=2)
-        self._camera_alarm_label_var = tk.StringVar(value="N/D")
-        ttk.Label(sidebar, textvariable=self._camera_alarm_label_var, font=("TkDefaultFont", 8)).pack(anchor=tk.W)
-        
+        self.video_label = self.ui.video_label
+        self.status_var = self.ui.status_var
+        self.resolution_var = self.ui.resolution_var
+        self.display_size_var = self.ui.display_size_var
+        self.decode_backend_var = self.ui.decode_backend_var
+        self.volume_var = self.ui.volume_var
+        self.snapshot_btn = self.ui.snapshot_btn
+        self.disconnect_btn = self.ui.disconnect_btn
+        self._vol_label_var = self.ui._vol_label_var
+        self._gate_label_var = self.ui._gate_label_var
+        self._audio_level_label_var = self.ui._audio_level_label_var
+        self._camera_alarm_label_var = self.ui._camera_alarm_label_var
+        self.vu_meter = self.ui.vu_meter
+        self._motion_meter = self.ui._motion_meter
+        self._camera_alarm_meter = self.ui._camera_alarm_meter
+        self.reconnect_banner = self.ui.reconnect_banner
+        self._vol_slider = self.ui.vol_slider
+        self._gate_slider = self.ui.gate_slider
+        self.ui.set_mute_button(self._muted)
+        self._sync_volume_ui()
+        self._set_connection_state("connecting")
         self._update_audio_meter_enabled()
-        self._redraw_gate_threshold_marker()
-        
-        # Start frame update loop
+        self.vu_meter.set_gate_db(self.audio_gate_db)
+        self._update_technical_details()
         self._update_display_loop()
         self._meter_ui_loop()
 
+    def _sync_volume_ui(self):
+        vol = int(self._playback_volume)
+        self._vol_slider.set(vol)
+        self._vol_label_var.set(f"{vol} %")
+        self.volume_var.set(f"Vol: {vol}")
+
+    def _set_connection_state(self, state: str) -> None:
+        self.ui.status_pill.set_state(state)
+        if state == "reconnecting":
+            self.reconnect_banner.show()
+        else:
+            self.reconnect_banner.hide()
+
+    def _set_status_short(self, text: str) -> None:
+        self.status_var.set(text)
+
+    def _update_technical_details(self) -> None:
+        parts = [self._build_params_display()]
+        res = self.resolution_var.get()
+        if res:
+            parts.append(f"Resolución stream: {res}")
+        disp = self.display_size_var.get()
+        if disp:
+            parts.append(disp)
+        dec = self.decode_backend_var.get()
+        if dec:
+            parts.append(f"Decode: {dec}")
+        parts.append(f"Audio: {self._audio_backend_label()}")
+        self.ui.set_params_display("\n".join(parts))
+
+    def _toggle_details_panel(self) -> None:
+        self.ui.toggle_details()
+
+    def _toggle_help_panel(self) -> None:
+        self.ui.toggle_help()
+
+    def _toggle_mute(self) -> None:
+        if self._muted:
+            self._muted = False
+            self._playback_volume = max(0, min(100, self._volume_before_mute))
+        else:
+            self._muted = True
+            if self._playback_volume > 0:
+                self._volume_before_mute = self._playback_volume
+            self._playback_volume = 0
+        self.ui.set_mute_button(self._muted)
+        self._sync_volume_ui()
+        self._schedule_save_prefs()
+        if not self._uses_live_audio_gate():
+            self._schedule_ffplay_audio_restart()
+
+    def _toggle_fullscreen(self, _event=None) -> None:
+        self._fullscreen = not self._fullscreen
+        if self._fullscreen:
+            for w in (self.ui.toolbar, self.ui.sidebar, self.ui.footer):
+                w.pack_forget()
+            if self.ui._details_open:
+                self.ui.details_panel.pack_forget()
+            if self.ui._help_open:
+                self.ui.help_panel.pack_forget()
+            self.ui.content.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
+            self.ui.set_ptz_hint_visible(False)
+        else:
+            self.ui.set_ptz_hint_visible(True)
+            self.ui.toolbar.pack(side=tk.TOP, fill=tk.X)
+            self.ui.content.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
+            self.ui.footer.pack(side=tk.BOTTOM, fill=tk.X)
+            if self.ui._details_open:
+                self.ui.details_panel.pack(side=tk.BOTTOM, fill=tk.X, before=self.ui.footer)
+            if self.ui._help_open:
+                self.ui.help_panel.pack(side=tk.BOTTOM, fill=tk.X, before=self.ui.footer)
+
+    def _apply_gate_preset(self, db: float) -> None:
+        self.audio_gate_db = float(db)
+        self._gate_slider.set(self.audio_gate_db)
+        self._on_gate_slider(self.audio_gate_db)
+
+    def _on_root_configure(self, event) -> None:
+        if event.widget != self.root:
+            return
+        if self._geom_save_after_id is not None:
+            self.root.after_cancel(self._geom_save_after_id)
+        self._geom_save_after_id = self.root.after(500, self._save_window_geometry)
+
+    def _save_window_geometry(self) -> None:
+        self._geom_save_after_id = None
+        try:
+            geom = self.root.geometry()
+            vol_save = self._volume_before_mute if self._muted else self._playback_volume
+            _save_viewer_prefs(
+                vol_save, self.audio_gate_db,
+                geometry=geom, muted=self._muted,
+                volume_before_mute=self._volume_before_mute,
+                ui_scale=self.ui_scale,
+            )
+        except tk.TclError:
+            pass
+
+    def _samples_db(self, samples) -> float:
+        """Nivel RMS en dB de un bloque de muestras (misma escala que el medidor)."""
+        if np is None:
+            return AUDIO_DB_FLOOR
+        arr = np.asarray(samples, dtype=np.float64)
+        if arr.size == 0:
+            return AUDIO_DB_FLOOR
+        rms = float(np.sqrt(np.mean(np.square(arr))))
+        return max(AUDIO_DB_FLOOR, min(AUDIO_DB_CEIL, 20.0 * np.log10(rms + 1e-9)))
+
+    def _gate_is_open(self, samples=None) -> bool:
+        """True si el audio debe pasar según umbral (alineado con la línea del medidor)."""
+        db_thresh = float(self.audio_gate_db)
+        if db_thresh <= GATE_SLIDER_MIN + 1:
+            return True
+        level_db = float(getattr(self, "_audio_level_db", AUDIO_DB_FLOOR))
+        if samples is not None and np is not None:
+            chunk_db = self._samples_db(samples)
+            if max(chunk_db, level_db) >= db_thresh:
+                return True
+            return False
+        return level_db >= db_thresh
+
     def _apply_audio_gate(self, samples):
-        """Puerta por RMS en dB (misma escala que el medidor y el slider)."""
-        db_thresh = self.audio_gate_db
-        if db_thresh is None or db_thresh <= GATE_SLIDER_MIN + 1:
+        """Puerta en dB: usa EMA del medidor + pico del bloque actual."""
+        if self._gate_is_open(samples):
             return samples
         if np is None:
             return samples
         arr = np.asarray(samples, dtype=np.float32)
-        if arr.size == 0:
-            return arr
-        rms = float(np.sqrt(np.mean(np.square(arr))))
-        chunk_db = 20.0 * np.log10(rms + 1e-9)
-        if chunk_db < db_thresh:
-            return np.zeros_like(arr)
-        return arr
+        return np.zeros_like(arr)
+
+    def _ffplay_audio_filter(self):
+        """Filtro FFmpeg para ffplay; None si el umbral está desactivado."""
+        db = float(self.audio_gate_db)
+        if db <= GATE_SLIDER_MIN + 1:
+            return None
+        th_lin = max(1e-6, min(1.0, 10 ** (db / 20.0)))
+        return (
+            f"agate=threshold={th_lin:.8f}:ratio=9000:range=1:"
+            f"attack=0.01:release=0.05"
+        )
+
+    def _audio_backend_label(self) -> str:
+        if getattr(self, "_use_pyav", False):
+            return "PyAV sync (umbral en vivo)"
+        if getattr(self, "_use_pyav_audio_sidecar", False):
+            return "PyAV + altavoz (umbral en vivo)"
+        if self._audio_process is not None and self._audio_process.poll() is None:
+            return "ffplay (umbral al reiniciar audio)"
+        if shutil.which("ffplay"):
+            return "ffplay"
+        return "sin audio"
 
     def _uses_live_audio_gate(self):
         """True si la puerta se aplica en el callback (PyAV), no vía ffplay."""
         return self._use_pyav or self._use_pyav_audio_sidecar
 
     def _update_audio_meter_enabled(self):
-        if getattr(self, "_audio_meter", None) is None:
+        if getattr(self, "vu_meter", None) is None:
             return
         pyav_audio = self._uses_live_audio_gate() and getattr(self, "_audio_queue", None) is not None
         ffplay_meter = (
@@ -333,13 +445,13 @@ class FoscamViewer:
             and getattr(self, "_audio_meter_thread", None) is not None
         )
         if pyav_audio or ffplay_meter:
-            self._audio_meter.state(["!disabled"])
+            self.vu_meter.set_enabled(True)
             if not pyav_audio and ffplay_meter:
                 self._audio_level_label_var.set("— dB (demux aux.)")
             else:
                 self._audio_level_label_var.set("— dB")
         else:
-            self._audio_meter.state(["disabled"])
+            self.vu_meter.set_enabled(False)
             if not AUDIO_AVAILABLE:
                 self._audio_level_label_var.set("Sin audio")
             elif not PYAV_AUDIO_AVAILABLE:
@@ -356,29 +468,27 @@ class FoscamViewer:
 
     def _do_save_prefs(self):
         self._prefs_save_after_id = None
-        _save_viewer_prefs(self._playback_volume, self.audio_gate_db)
+        try:
+            geom = self.root.geometry()
+        except tk.TclError:
+            geom = None
+        vol_save = self._volume_before_mute if self._muted else self._playback_volume
+        _save_viewer_prefs(
+            vol_save, self.audio_gate_db,
+            geometry=geom, muted=self._muted,
+            volume_before_mute=self._volume_before_mute,
+            ui_scale=self.ui_scale,
+        )
 
-    def _gate_threshold_canvas_x(self):
-        db = max(AUDIO_DB_FLOOR, min(AUDIO_DB_CEIL, self.audio_gate_db))
-        span = AUDIO_DB_CEIL - AUDIO_DB_FLOOR
-        if span <= 0:
-            return 0
-        ratio = (db - AUDIO_DB_FLOOR) / span
-        return int(ratio * (AUDIO_METER_CANVAS_W - 4)) + 2
-
-    def _redraw_gate_threshold_marker(self):
-        c = getattr(self, "_audio_meter_canvas", None)
-        if c is None:
-            return
-        c.delete("gate_marker")
-        x = self._gate_threshold_canvas_x()
-        c.create_line(x, 1, x, AUDIO_METER_CANVAS_H - 1, fill="#c62828", width=2, tags="gate_marker")
-
-    def _on_volume_slider(self, _value=None):
-        vol = int(round(self._vol_var.get()))
+    def _on_volume_slider(self, value=None):
+        vol = int(round(float(value if value is not None else self._vol_slider.get())))
         vol = max(0, min(100, vol))
-        if vol == self._playback_volume:
+        if vol == self._playback_volume and not self._muted:
             return
+        if vol > 0:
+            self._muted = False
+            self.ui.set_mute_button(False)
+            self._volume_before_mute = vol
         self._playback_volume = vol
         self._vol_label_var.set(f"{vol} %")
         self.volume_var.set(f"Vol: {vol}")
@@ -387,11 +497,13 @@ class FoscamViewer:
             return
         self._schedule_ffplay_audio_restart()
 
-    def _on_gate_slider(self, _value=None):
-        self.audio_gate_db = float(self._gate_var.get())
+    def _on_gate_slider(self, value=None):
+        self.audio_gate_db = float(value if value is not None else self._gate_slider.get())
         self._gate_label_var.set(f"{self.audio_gate_db:.0f} dB")
-        self._redraw_gate_threshold_marker()
+        self.vu_meter.set_gate_db(self.audio_gate_db)
+        self.ui.highlight_gate_preset(self.audio_gate_db)
         self._schedule_save_prefs()
+        self._update_technical_details()
         if self._uses_live_audio_gate():
             return
         self._schedule_ffplay_audio_restart()
@@ -401,7 +513,7 @@ class FoscamViewer:
             return
         if self._gate_restart_after_id is not None:
             self.root.after_cancel(self._gate_restart_after_id)
-        self._gate_restart_after_id = self.root.after(350, self._do_ffplay_audio_restart)
+        self._gate_restart_after_id = self.root.after(200, self._do_ffplay_audio_restart)
 
     def _do_ffplay_audio_restart(self):
         self._gate_restart_after_id = None
@@ -529,7 +641,7 @@ class FoscamViewer:
                         pass
         except Exception as e:
             if self.is_streaming and self._use_pyav_audio_sidecar:
-                self.root.after(0, lambda err=str(e): self.status_var.set(f"Audio: {err}"))
+                self.root.after(0, lambda err=str(e): self._set_status_short(f"Audio: {err}"))
         finally:
             if container is not None:
                 try:
@@ -605,22 +717,24 @@ class FoscamViewer:
 
     def _meter_ui_loop(self):
         try:
-            self._redraw_gate_threshold_marker()
-            self._audio_meter["value"] = self._audio_level
+            self.vu_meter.redraw(self._audio_level)
             gate_db = self.audio_gate_db
             self._audio_level_label_var.set(
-                f"{self._audio_level_db:.1f} dB (puerta {gate_db:.0f})"
+                f"{self._audio_level_db:.1f} dB (umbral {gate_db:.0f})"
             )
-            self._motion_meter["value"] = self._motion_level
+            self._motion_meter.set(self._motion_level / 100.0)
             if self._camera_alarm_active is None:
-                self._camera_alarm_meter["value"] = 0
+                self._camera_alarm_meter.set(0)
                 self._camera_alarm_label_var.set("N/D")
+                self.ui.set_alarm_badge(None)
             elif self._camera_alarm_active:
-                self._camera_alarm_meter["value"] = 100
+                self._camera_alarm_meter.set(1.0)
                 self._camera_alarm_label_var.set("Activa")
+                self.ui.set_alarm_badge(True)
             else:
-                self._camera_alarm_meter["value"] = 0
+                self._camera_alarm_meter.set(0)
                 self._camera_alarm_label_var.set("Inactiva")
+                self.ui.set_alarm_badge(False)
         except tk.TclError:
             pass
         self.root.after(100, self._meter_ui_loop)
@@ -682,9 +796,14 @@ class FoscamViewer:
             self.root.bind(f"<KeyPress-{key}>", lambda e, c=cmd: self._ptz_move(c))
             self.root.bind(f"<KeyRelease-{key}>", lambda e: self._ptz_stop())
         self.root.bind("<KeyPress>", self._on_any_keypress)
-        # Ensure window receives key events
+        self.root.bind("<F11>", self._toggle_fullscreen)
+        self.root.bind("<Escape>", lambda e: self._exit_fullscreen_if_active())
         self.root.focus_set()
         self.root.bind("<FocusIn>", lambda e: self.root.focus_set())
+
+    def _exit_fullscreen_if_active(self) -> None:
+        if self._fullscreen:
+            self._toggle_fullscreen()
     
     def _ptz_worker(self):
         """Worker que envía comandos PTZ desde la cola; un solo hilo evita latencia de crear hilo por tecla."""
@@ -738,9 +857,12 @@ class FoscamViewer:
             return
         self._playback_volume = new_vol
         self.volume_var.set(f"Vol: {new_vol}")
-        if hasattr(self, "_vol_var"):
-            self._vol_var.set(new_vol)
+        if hasattr(self, "_vol_slider"):
+            self._vol_slider.set(new_vol)
             self._vol_label_var.set(f"{new_vol} %")
+        if new_vol > 0 and self._muted:
+            self._muted = False
+            self.ui.set_mute_button(False)
         if self._uses_live_audio_gate():
             return
         self._schedule_ffplay_audio_restart()
@@ -751,7 +873,8 @@ class FoscamViewer:
     
     def _connect_camera(self):
         """Connect to the camera and start streaming."""
-        # Start connection in a separate thread
+        self._set_connection_state("connecting")
+        self._set_status_short(f"Conectando a {self.camera_ip}:{self.camera_port}…")
         threading.Thread(target=self._start_stream, daemon=True).start()
     
     def _gst_uri_safe(self, rtsp_url):
@@ -874,7 +997,10 @@ class FoscamViewer:
 
         for rtsp_url in rtsp_urls:
             try:
-                self.root.after(0, lambda url=rtsp_url: self.status_var.set(f"Trying RTSP: {url.split('@')[1]}..."))
+                self.root.after(0, lambda: self._set_connection_state("connecting"))
+                self.root.after(0, lambda url=rtsp_url: self._set_status_short(
+                    f"Conectando RTSP {url.split('@')[1]}…",
+                ))
                 
                 # Ruta PyAV: un solo contenedor vídeo+audio (sync), sin subproceso
                 if PYAV_AUDIO_AVAILABLE and not self.use_nvidia_decode:
@@ -891,7 +1017,9 @@ class FoscamViewer:
                             self._av_video_stream = video_stream
                             self._av_audio_stream = audio_stream
                             self.rtsp_url = rtsp_url
-                            self.root.after(0, lambda: self.status_var.set(f"Connected via RTSP (PyAV): {rtsp_url.split('@')[1]}"))
+                            self.root.after(0, lambda url=rtsp_url: self._set_status_short(
+                                f"RTSP PyAV {url.split('@')[1]}",
+                            ))
                             self.is_streaming = True
                             self._use_pyav = True
                             self._decode_backend = "ffmpeg"
@@ -947,7 +1075,9 @@ class FoscamViewer:
                     ret, test_frame = self.cap.read()
                     if ret and test_frame is not None:
                         self.rtsp_url = rtsp_url
-                        self.root.after(0, lambda: self.status_var.set(f"Connected via RTSP: {rtsp_url.split('@')[1]}"))
+                        self.root.after(0, lambda url=rtsp_url: self._set_status_short(
+                            f"RTSP {url.split('@')[1]}",
+                        ))
                         self.is_streaming = True
                         self.root.after(0, self._update_ui_connected)
                         # Fetch camera name and update window title
@@ -999,7 +1129,7 @@ class FoscamViewer:
                         if name:
                             self.camera_name = name
                             self.root.after(0, lambda n=name: self.root.title(f"Foscam - {n}"))
-                            self.root.after(0, lambda n=name: self.info_var.set(f"{n} | {self.camera_ip}:{self.camera_port}"))
+                            self.root.after(0, lambda n=name: self.ui.set_camera_title(n))
             except Exception:
                 pass
         threading.Thread(target=do_fetch, daemon=True).start()
@@ -1080,7 +1210,7 @@ class FoscamViewer:
                             pass
         except Exception as e:
             if self.is_streaming:
-                self.root.after(0, lambda err=str(e): self.status_var.set(f"Stream: {err}"))
+                self.root.after(0, lambda err=str(e): self._set_status_short(f"Stream: {err}"))
         finally:
             if container is not None:
                 try:
@@ -1096,10 +1226,8 @@ class FoscamViewer:
         try:
             vol = max(0, min(100, getattr(self, "_playback_volume", 50)))
             cmd = ["ffplay", "-nodisp", "-autoexit", "-volume", str(vol), "-i", self.rtsp_url]
-            # Puerta de volumen: silenciar por debajo de audio_gate_db (ej. -40 dB)
-            if self.audio_gate_db is not None and self.audio_gate_db > GATE_SLIDER_MIN + 1:
-                th = self.audio_gate_db
-                af = f"compand=attacks=0.05|0.05:decays=0.05|0.05:points=-90/-70|{th - 0.1}/-70|{th}/0"
+            af = self._ffplay_audio_filter()
+            if af:
                 cmd = ["ffplay", "-nodisp", "-autoexit", "-volume", str(vol), "-af", af, "-i", self.rtsp_url]
             # start_new_session=True para poder matar el grupo al cerrar (evita que ffplay quede abierto)
             self._audio_process = subprocess.Popen(
@@ -1118,7 +1246,7 @@ class FoscamViewer:
             pass
         except Exception as e:
             if self.is_streaming:
-                self.root.after(0, lambda err=str(e): self.status_var.set(f"Audio: {err}"))
+                self.root.after(0, lambda err=str(e): self._set_status_short(f"Audio: {err}"))
         finally:
             self._audio_process = None
     
@@ -1141,7 +1269,10 @@ class FoscamViewer:
                 else:
                     # Stream ended or error
                     if self.is_streaming:
-                        self.root.after(0, lambda: self.status_var.set("Stream interrupted, attempting reconnect..."))
+                        self.root.after(0, lambda: self._set_connection_state("reconnecting"))
+                        self.root.after(0, lambda: self._set_status_short(
+                            "Stream interrumpido, reconectando…",
+                        ))
                         time.sleep(2)
                         # Try to reconnect
                         if self.is_streaming:
@@ -1150,7 +1281,8 @@ class FoscamViewer:
                 time.sleep(read_interval)
             except Exception as e:
                 if self.is_streaming:
-                    self.root.after(0, lambda err=str(e): self.status_var.set(f"Stream error: {err}"))
+                    self.root.after(0, lambda: self._set_connection_state("reconnecting"))
+                    self.root.after(0, lambda err=str(e): self._set_status_short(f"Stream error: {err}"))
                 time.sleep(1)
                 if not self.is_streaming:
                     break
@@ -1162,85 +1294,68 @@ class FoscamViewer:
         self._display_size = (event.width, event.height)
 
     def _update_display_loop(self):
-        """Continuously update display from frame queue. Scales video to window size."""
+        """Actualiza el vídeo con el último frame de la cola (ImageTk, más liviano que CTkImage)."""
         try:
-            # Get latest frame from queue (non-blocking)
-            try:
-                frame = self.frame_queue.get_nowait()
-                
-                # Resize frame to fit display (dynamic: follows window size)
+            frame = None
+            while True:
+                try:
+                    frame = self.frame_queue.get_nowait()
+                except queue.Empty:
+                    break
+
+            if frame is not None:
                 if self._display_size and self._display_size[0] > 1 and self._display_size[1] > 1:
                     display_width, display_height = self._display_size
                 else:
                     display_width = self.video_label.winfo_width()
                     display_height = self.video_label.winfo_height()
-                
+
                 if display_width > 1 and display_height > 1:
-                    # Resize maintaining aspect ratio
                     height, width = frame.shape[:2]
                     scale = min(display_width / width, display_height / height)
-                    new_width = int(width * scale)
-                    new_height = int(height * scale)
-                    
-                    frame_resized = cv2.resize(frame, (new_width, new_height), interpolation=cv2.INTER_LINEAR)
+                    new_width = max(1, int(width * scale))
+                    new_height = max(1, int(height * scale))
+                    interp = cv2.INTER_AREA if new_width < width else cv2.INTER_LINEAR
+                    frame_resized = cv2.resize(
+                        frame, (new_width, new_height), interpolation=interp,
+                    )
                 else:
                     frame_resized = frame
-                
-                # Convert BGR to RGB
+                    new_width, new_height = frame.shape[1], frame.shape[0]
+
                 frame_rgb = cv2.cvtColor(frame_resized, cv2.COLOR_BGR2RGB)
-                
-                # Convert to PIL Image
                 image = Image.fromarray(frame_rgb)
-                photo = ImageTk.PhotoImage(image=image)
-                
-                # Update label
-                self.video_label.config(image=photo, text="")
-                self.video_label.image = photo  # Keep a reference
-                
-                # Store current frame for snapshot
+                size = (new_width, new_height)
+                self._video_photo = ImageTk.PhotoImage(image=image)
+                self._last_image_size = size
+                self.video_label.configure(image=self._video_photo, text="")
+                self.video_label.image = self._video_photo
+
                 self.current_frame = frame
                 self._motion_level = self._compute_motion_level(frame)
-                # Show stream resolution in status bar (width x height)
                 h, w = frame.shape[:2]
                 self.resolution_var.set(f"{w}×{h}")
-                # Show video area size used for display (and for sub stream CGI comparison)
                 if display_width > 1 and display_height > 1:
                     self.display_size_var.set(f"Display {display_width}×{display_height}")
-                
-            except queue.Empty:
-                # No new frame available, keep current display
-                pass
-                
+                self._display_frame_count += 1
+                if self._display_frame_count % DISPLAY_DETAIL_EVERY_N == 0:
+                    self._update_technical_details()
+
         except Exception as e:
             if self.is_streaming:
-                self.status_var.set(f"Display error: {str(e)}")
-        
-        # Schedule next update (aim for ~30 FPS display)
-        # Refresco más frecuente (~50 FPS) para que el último frame se muestre antes
-        self.root.after(20, self._update_display_loop)
+                self._set_status_short(f"Display error: {str(e)}")
+
+        self.root.after(DISPLAY_INTERVAL_MS, self._update_display_loop)
     
     def _update_ui_connected(self):
         """Update UI after successful connection."""
-        msg = f"En vivo {self.camera_ip}:{self.camera_port}"
+        self.root.after(0, lambda: self._set_connection_state("live"))
+        parts = [f"En vivo · {self.camera_ip}:{self.camera_port}"]
         if self.use_sub_stream:
-            msg += " (sub stream)"
-        if getattr(self, "_use_pyav", False):
-            msg += " (PyAV, sync)"
-        elif getattr(self, "_use_pyav_audio_sidecar", False):
-            msg += " (audio PyAV, puerta en vivo)"
+            parts.append("sub stream")
         if AUDIO_AVAILABLE:
-            msg += " (video + audio)"
-        if self.use_nvidia_decode and getattr(self, "_decode_backend", "ffmpeg") != "nvidia":
-            if getattr(self, "_nvh264dec_available", False):
-                err = getattr(self, "_gst_nvidia_error", None)
-                if err:
-                    msg += f" (NVIDIA: {err})"
-                else:
-                    msg += " (NVIDIA: error pipeline)"
-            else:
-                msg += " (NVIDIA: instale plugin nvcodec, gst-inspect-1.0 nvh264dec)"
-        msg += " | Flechas: PTZ, 0: reset, a/z: volumen"
-        self.status_var.set(msg)
+            parts.append("vídeo + audio")
+        self._set_status_short(" · ".join(parts))
         self.root.after(0, self._update_audio_meter_enabled)
         backend = getattr(self, "_decode_backend", "ffmpeg")
         if backend == "nvidia":
@@ -1249,10 +1364,12 @@ class FoscamViewer:
             self.decode_backend_var.set("NVIDIA✗")
         else:
             self.decode_backend_var.set("")
-    
+        self.root.after(0, self._update_technical_details)
+
     def _connection_failed(self, error_msg):
         """Handle connection failure."""
-        self.status_var.set(f"Error de conexión: {error_msg}")
+        self._set_connection_state("error")
+        self._set_status_short(f"Error de conexión: {error_msg}")
         messagebox.showerror("Error de conexión", f"No se pudo conectar a la cámara:\n{error_msg}")
         # Close window after showing error
         self.root.after(2000, self.root.destroy)
@@ -1335,12 +1452,15 @@ class FoscamViewer:
                 break
         
         self.current_frame = None
-        self.video_label.config(image="", text="Desconectado")
+        self.video_label.configure(image="", text="Desconectado")
         self.video_label.image = None
-        
-        self.status_var.set("Desconectado")
+        self._video_photo = None
+        self._last_image_size = None
+        self._set_connection_state("offline")
+        self._set_status_short("Desconectado")
         self.resolution_var.set("")
         self.display_size_var.set("")
+        self._update_technical_details()
     
     def _take_snapshot(self):
         """Take a snapshot and save it."""
@@ -1356,7 +1476,7 @@ class FoscamViewer:
             
             # Save frame
             cv2.imwrite(filename, self.current_frame)
-            self.status_var.set(f"Captura guardada: {filename}")
+            self._set_status_short(f"Captura guardada: {filename}")
             messagebox.showinfo("Listo", f"Captura guardada en:\n{filename}")
             
         except Exception as e:
@@ -1364,6 +1484,7 @@ class FoscamViewer:
     
     def _on_closing(self):
         """Handle window closing event."""
+        self._save_window_geometry()
         self._do_save_prefs()
         self._disconnect_camera()
         self.root.destroy()
@@ -1424,7 +1545,7 @@ Sin ellos se usa ffplay en subproceso (sin sync perfecto).
         default=None,
         metavar='dB',
         help=(
-            'Puerta de ruido: solo se oye el audio por ENCIMA de este nivel (dB). '
+            'Umbral de ruido: solo se oye el audio por ENCIMA de este nivel (dB). '
             'Por debajo → silencio; por encima → se escucha normal. '
             'Por defecto -38 (deja llanto/ruidos fuertes, corta música suave). '
             'Ej: -40 más permisivo; -30 solo sonidos muy fuertes. Use un valor muy bajo (ej. -90) para desactivar.'
@@ -1436,6 +1557,17 @@ Sin ellos se usa ffplay en subproceso (sin sync perfecto).
         action='store_true',
         help='Decodificar video con GPU NVIDIA (GStreamer nvh264dec). Requiere OpenCV con GStreamer y plugins nvcodec. Si falla, se usa FFmpeg (CPU).'
     )
+
+    parser.add_argument(
+        '--ui-scale',
+        type=float,
+        default=None,
+        metavar='FACTOR',
+        help=(
+            'Escala de la interfaz CustomTkinter (default: valor en viewer.json o 2.0). '
+            'Ej: 1.5, 2.0, 2.5. Afecta controles y tamaño sugerido de ventana.'
+        ),
+    )
     
     args = parser.parse_args()
     
@@ -1444,13 +1576,18 @@ Sin ellos se usa ffplay en subproceso (sin sync perfecto).
         print("Error: IP address is required", file=sys.stderr)
         sys.exit(1)
     
-    # Create GUI
-    root = tk.Tk()
+    prefs = _load_viewer_prefs()
+    ui_scale = getattr(args, "ui_scale", None)
+    if ui_scale is None:
+        ui_scale = prefs.get("ui_scale", ui_theme.DEFAULT_UI_SCALE)
+    ui_theme.apply_theme(float(ui_scale))
+    root = ctk.CTk()
     app = FoscamViewer(
         root, args.ip.strip(), args.port, args.user, args.password,
         use_sub_stream=args.sub,
         audio_gate_db=args.audio_gate_db,
         use_nvidia_decode=args.nvidia,
+        ui_scale=ui_scale,
     )
     root.mainloop()
 

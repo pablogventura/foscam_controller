@@ -46,7 +46,7 @@ pipx uninstall foscam-controller
 
 - **Descubrimiento**: Escaneo de la red local para encontrar cámaras Foscam (puertos 80, 88, 8080).
 - **Configuración**: Exportar toda la configuración de una cámara a JSON y aplicarla a otras (con modo dry-run).
-- **Visor**: GUI para ver el stream RTSP en vivo, control PTZ con flechas, snapshot, audio (PyAV o ffplay).
+- **Visor**: GUI CustomTkinter (tema oscuro) para stream RTSP, PTZ (teclado y cruceta), snapshot, audio (PyAV o ffplay).
 - **Consola CGI**: Terminal con autocompletado (Tab) para probar cualquier comando de la API.
 
 ---
@@ -56,7 +56,7 @@ pipx uninstall foscam-controller
 - Python 3.7+
 - Red local con cámaras Foscam (misma subred)
 
-Opcional para el visor: **audio** → `av`, `sounddevice` y/o `ffplay` (FFmpeg). **Decodificación GPU** → OpenCV con GStreamer y plugins nvcodec (NVIDIA).
+El visor requiere **customtkinter** (se instala con el paquete). Opcional: **audio** → `av`, `sounddevice` y/o `ffplay` (FFmpeg). **Decodificación GPU** → OpenCV con GStreamer y plugins nvcodec (NVIDIA).
 
 ---
 
@@ -97,28 +97,30 @@ foscam apply --ip 192.168.1.7 --user admin --password xxx --file cam.json
 foscam view --ip 192.168.1.6 --user admin --password xxx [--port 88] [--sub] [--nvidia] [--audio-gate-db -38]
 ```
 
-Panel lateral derecho en la ventana del visor:
+Interfaz: barra superior (estado, captura, silenciar), vídeo con cruceta PTZ, panel **AUDIO** / **SENSORES** a la derecha, barra inferior con **Detalles** y **Ayuda** colapsables.
 
 | Control | Descripción |
 |---------|-------------|
-| Volumen | Slider 0–100 (también teclas `a` / `z`) |
-| Puerta audio (dB) | Umbral de ruido: solo se oye por encima de este nivel (`--audio-gate-db` por CLI, ajustable en vivo) |
-| Nivel audio | Barra del nivel entrante en dB (requiere ruta PyAV con audio) |
-| Movimiento (imagen) | Cambio entre frames en el video |
-| Alarma cámara | Estado vía CGI (`getDevState`, etc.); puede mostrar N/D según modelo |
+| Volumen | Slider 0–100 (también `a` / `z`); botón **Silenciar** |
+| Umbral de ruido | Solo se oye por encima de este nivel (`--audio-gate-db` por CLI); presets Llanto / Suave / Off |
+| Nivel audio | Medidor con línea roja = umbral |
+| Movimiento (imagen) | Cambio entre frames |
+| Alarma cámara | Estado vía CGI; puede mostrar N/D según modelo |
 
-La **línea roja** sobre la barra de nivel audio marca el umbral de la puerta (gate). Volumen y puerta se recuerdan en `~/.config/foscam-controller/viewer.json`.
+Preferencias en `~/.config/foscam-controller/viewer.json`: volumen, umbral, geometría, silenciado, `ui_scale` (default **2.0**).
 
-Con ruta **ffplay** (sin PyAV en el stream principal), si está instalado `av`, un demux auxiliar alimenta la barra de nivel de audio.
+Escala de interfaz: `foscam view ... --ui-scale 1.5` (o `2.5`). Sin argumento usa `ui_scale` guardado o 2.0.
 
-Atajos en el visor:
+Atajos:
 
 | Tecla      | Acción                    |
 |-----------|----------------------------|
 | Flechas   | Mover PTZ (mantener/soltar)|
-| 0         | Ir al preset por defecto   |
+| Cruceta   | PTZ con ratón (mantener/soltar)|
+| 0         | Preset por defecto         |
 | a / z     | Subir / bajar volumen      |
-| Captura   | Guardar captura            |
+| F11       | Pantalla completa          |
+| Esc       | Salir de pantalla completa |
 
 Ejecutar el visor como módulo (sin usar el CLI):
 
@@ -160,7 +162,8 @@ foscam_controller/
 │   ├── client.py           # Cliente HTTP API CGI (FoscamClient)
 │   ├── discover.py         # Descubrimiento en red
 │   ├── config_io.py        # Lectura/escritura de configuración JSON
-│   ├── viewer.py           # Visor GUI (RTSP, PTZ, snapshot, audio)
+│   ├── viewer.py           # Visor (RTSP, PTZ, snapshot, audio)
+│   └── ui/                 # Interfaz CustomTkinter del visor
 │   └── cgi_console.py      # Consola interactiva CGI
 └── scripts/
     └── publish_to_pypi.sh  # Publicar en PyPI (--test para Test PyPI)

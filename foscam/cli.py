@@ -57,6 +57,8 @@ def cmd_view(args) -> None:
         sys.argv.append("--nvidia")
     if getattr(args, "audio_gate_db", None) is not None:
         sys.argv.extend(["--audio-gate-db", str(args.audio_gate_db)])
+    if getattr(args, "ui_scale", None) is not None:
+        sys.argv.extend(["--ui-scale", str(args.ui_scale)])
     viewer_main()
 
 
@@ -126,7 +128,14 @@ Ejemplos:
         type=float,
         default=None,
         metavar="dB",
-        help="Puerta de ruido en dB (por defecto: valor guardado o -38)",
+        help="Umbral de ruido en dB (por defecto: valor guardado o -38)",
+    )
+    p_view.add_argument(
+        "--ui-scale",
+        type=float,
+        default=None,
+        metavar="FACTOR",
+        help="Escala UI (default: viewer.json o 2.0). Ej: 1.5, 2.0",
     )
     p_view.set_defaults(func=cmd_view)
 
