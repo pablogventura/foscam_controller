@@ -5,9 +5,21 @@ from __future__ import annotations
 DISPLAY_MAX_FPS = 60
 DISPLAY_IDLE_POLL_MS = 16
 DISPLAY_MIN_INTERVAL_MS = max(1, int(1000 / DISPLAY_MAX_FPS))
-MOTION_ANALYSIS_EVERY_N_FRAMES = 3
-MOTION_ANALYSIS_MIN_INTERVAL_SEC = 0.066
+DISPLAY_PROCESS_MAX_WIDTH = 640
+OVERLAY_EVERY_N_FRAMES = 1
+MOTION_ANALYSIS_EVERY_N_FRAMES = 6
+MOTION_ANALYSIS_MIN_INTERVAL_SEC = 0.15
 READER_QUEUE_FULL_SLEEP_SEC = 0.003
+
+
+def cap_display_size(
+    width: int, height: int, max_width: int = DISPLAY_PROCESS_MAX_WIDTH,
+) -> tuple:
+    """Reduce píxeles a pintar si la ventana es muy grande."""
+    if width <= max_width:
+        return width, height
+    scale = max_width / width
+    return max(1, int(width * scale)), max(1, int(height * scale))
 
 
 def next_display_delay_ms(queue_depth: int, elapsed_since_paint_ms: float) -> int:
@@ -22,7 +34,6 @@ def next_display_delay_ms(queue_depth: int, elapsed_since_paint_ms: float) -> in
 def motion_analysis_needed(
     *,
     show_live_overlay: bool,
-    show_configured_zones: bool,
     auto_zoom_enabled: bool,
     heatmap_enabled: bool,
     snapshot_enabled: bool,
@@ -31,7 +42,6 @@ def motion_analysis_needed(
     """True si algún consumidor necesita análisis de movimiento."""
     return any((
         show_live_overlay,
-        show_configured_zones,
         auto_zoom_enabled,
         heatmap_enabled,
         snapshot_enabled,

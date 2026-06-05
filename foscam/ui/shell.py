@@ -964,9 +964,12 @@ class ViewerShell:
         self._camera_title = name
         self.title_var.set(name)
 
-    def set_display_fps(self, fps: Optional[float]) -> None:
+    def set_display_fps(self, fps: Optional[float], decode_fps: Optional[float] = None) -> None:
         if fps is None or fps <= 0:
             self.fps_var.set("")
+            return
+        if decode_fps is not None and decode_fps > 0:
+            self.fps_var.set(f"{fps:.1f} fps · stream {decode_fps:.1f}")
         else:
             self.fps_var.set(f"{fps:.1f} fps")
 

@@ -4,7 +4,9 @@ import time
 
 from foscam.display_pacing import (
     DISPLAY_IDLE_POLL_MS,
+    DISPLAY_PROCESS_MAX_WIDTH,
     DISPLAY_MIN_INTERVAL_MS,
+    cap_display_size,
     motion_analysis_needed,
     next_display_delay_ms,
     should_run_motion_analysis,
@@ -64,7 +66,7 @@ def test_should_run_motion_analysis_every_n_frames():
     now = time.monotonic()
     assert should_run_motion_analysis(
         needed=True,
-        frame_index=3,
+        frame_index=6,
         last_analysis_monotonic=now,
         now_monotonic=now,
     ) is True
@@ -81,9 +83,19 @@ def test_should_run_motion_analysis_min_interval():
     assert should_run_motion_analysis(
         needed=True,
         frame_index=1,
-        last_analysis_monotonic=now - 0.1,
+        last_analysis_monotonic=now - 0.15,
         now_monotonic=now,
     ) is True
+
+
+def test_cap_display_size_scales_down():
+    w, h = cap_display_size(1920, 1080, max_width=DISPLAY_PROCESS_MAX_WIDTH)
+    assert w == DISPLAY_PROCESS_MAX_WIDTH
+    assert h == 360
+
+
+def test_cap_display_size_unchanged_when_small():
+    assert cap_display_size(800, 600) == (800, 600)
 
 
 def test_visual_overlays_needed_alarm_border():

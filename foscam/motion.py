@@ -373,9 +373,10 @@ class MotionAnalyzer:
     def analyze(self, frame) -> Tuple[float, List[Tuple[int, int, int, int]]]:
         if cv2 is None or frame is None:
             return 0.0, []
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         aw, ah = self._analysis_size(frame)
-        small = cv2.resize(gray, (aw, ah), interpolation=cv2.INTER_AREA)
+        small_bgr = cv2.resize(frame, (aw, ah), interpolation=cv2.INTER_AREA)
+        gray = cv2.cvtColor(small_bgr, cv2.COLOR_BGR2GRAY)
+        small = gray
         if self._prev_gray is None:
             self._prev_gray = small
             return 0.0, []
@@ -549,32 +550,30 @@ def expand_box(box: Tuple[int, int, int, int], margin_pct: float, width: int, he
     )
 
 
-def draw_motion_overlays(
-    frame,
-    settings: MotionSettings,
-    boxes: List[Tuple[int, int, int, int]],
-    md_info: Optional[MotionDetectInfo],
-    privacy_masks: Optional[List[ZoneRect]],
-    level: float,
-    src_size: Tuple[int, int],
-    letterbox_size: Tuple[int, int],
-    debug_text: Optional[str] = None,
-    alarm_flash: bool = False,
-):
-    if cv2 is None:
-        return frame
-    out = frame
-    fh, fw = out.shape[:2]
+class ZonesOverlayCache:
+    """Capa estática de zonas MD; evita redibujar la grilla en cada frame."""
 
-    if settings.privacy_mask_overlay and privacy_masks:
-        for zone in privacy_masks:
-            x1, y1, x2, y2 = zone_to_pixel_rect(zone, fw, fh)
-            cv2.rectangle(out, (x1, y1), (x2, y2), (0, 0, 0), -1)
+    def __init__(self) -> None:
+        self._key: Optional[tuple] = None
+        self._layer = None
 
-    if settings.show_configured_zones and md_info:
+    def invalidate(self) -> None:
+        self._key = None
+        self._layer = None
+
+    @staticmethod
+    def _md_signature(md_info: "MotionDetectInfo") -> tuple:
+        grid_sig = None
+        if md_info.grid:
+            grid_sig = tuple(tuple(row) for row in md_info.grid)
+        zones_sig = tuple(
+            (z.x1, z.y1, z.x2, z.y2) for z in (md_info.zones or [])
+        )
+        return grid_sig, zones_sig
+
+    def _build_layer(self, fw: int, fh: int, settings: MotionSettings, md_info: "MotionDetectInfo"):
         color = _hex_to_bgr(settings.zones_overlay_color)
-        alpha = max(0.0, min(1.0, settings.zones_overlay_alpha))
-        overlay = out.copy()
+        layer = np.zeros((fh, fw, 3), dtype=np.uint8)
         if md_info.grid:
             cell_w = fw / 10.0
             cell_h = fh / 10.0
@@ -587,16 +586,88 @@ def draw_motion_overlays(
                     x2 = int((col + 1) * cell_w)
                     y2 = int((row + 1) * cell_h)
                     if settings.zones_overlay_style == "fill":
-                        cv2.rectangle(overlay, (x1, y1), (x2, y2), color, -1)
+                        cv2.rectangle(layer, (x1, y1), (x2, y2), color, -1)
                     else:
-                        cv2.rectangle(overlay, (x1, y1), (x2, y2), color, 1)
+                        cv2.rectangle(layer, (x1, y1), (x2, y2), color, 1)
         for zone in md_info.zones:
             x1, y1, x2, y2 = zone_to_pixel_rect(zone, fw, fh)
             if settings.zones_overlay_style == "fill":
-                cv2.rectangle(overlay, (x1, y1), (x2, y2), color, -1)
+                cv2.rectangle(layer, (x1, y1), (x2, y2), color, -1)
             else:
-                cv2.rectangle(overlay, (x1, y1), (x2, y2), color, 2)
-        out = cv2.addWeighted(overlay, alpha, out, 1.0 - alpha, 0)
+                cv2.rectangle(layer, (x1, y1), (x2, y2), color, 2)
+        return layer
+
+    def apply(self, frame, settings: MotionSettings, md_info: Optional["MotionDetectInfo"]):
+        if not settings.show_configured_zones or md_info is None:
+            return frame
+        fh, fw = frame.shape[:2]
+        sig = self._md_signature(md_info)
+        key = (
+            fw, fh,
+            settings.zones_overlay_color,
+            settings.zones_overlay_style,
+            settings.zones_overlay_alpha,
+            sig,
+        )
+        if key != self._key or self._layer is None:
+            self._layer = self._build_layer(fw, fh, settings, md_info)
+            self._key = key
+        alpha = max(0.0, min(1.0, settings.zones_overlay_alpha))
+        return cv2.addWeighted(self._layer, alpha, frame, 1.0 - alpha, 0)
+
+
+def draw_motion_overlays(
+    frame,
+    settings: MotionSettings,
+    boxes: List[Tuple[int, int, int, int]],
+    md_info: Optional[MotionDetectInfo],
+    privacy_masks: Optional[List[ZoneRect]],
+    level: float,
+    src_size: Tuple[int, int],
+    letterbox_size: Tuple[int, int],
+    debug_text: Optional[str] = None,
+    alarm_flash: bool = False,
+    zones_cache: Optional[ZonesOverlayCache] = None,
+):
+    if cv2 is None:
+        return frame
+    out = frame
+    fh, fw = out.shape[:2]
+
+    if settings.privacy_mask_overlay and privacy_masks:
+        for zone in privacy_masks:
+            x1, y1, x2, y2 = zone_to_pixel_rect(zone, fw, fh)
+            cv2.rectangle(out, (x1, y1), (x2, y2), (0, 0, 0), -1)
+
+    if settings.show_configured_zones and md_info:
+        if zones_cache is not None:
+            out = zones_cache.apply(out, settings, md_info)
+        else:
+            color = _hex_to_bgr(settings.zones_overlay_color)
+            alpha = max(0.0, min(1.0, settings.zones_overlay_alpha))
+            overlay = np.zeros((fh, fw, 3), dtype=np.uint8)
+            if md_info.grid:
+                cell_w = fw / 10.0
+                cell_h = fh / 10.0
+                for row, row_cells in enumerate(md_info.grid):
+                    for col, active in enumerate(row_cells):
+                        if not active:
+                            continue
+                        x1 = int(col * cell_w)
+                        y1 = int(row * cell_h)
+                        x2 = int((col + 1) * cell_w)
+                        y2 = int((row + 1) * cell_h)
+                        if settings.zones_overlay_style == "fill":
+                            cv2.rectangle(overlay, (x1, y1), (x2, y2), color, -1)
+                        else:
+                            cv2.rectangle(overlay, (x1, y1), (x2, y2), color, 1)
+            for zone in md_info.zones:
+                x1, y1, x2, y2 = zone_to_pixel_rect(zone, fw, fh)
+                if settings.zones_overlay_style == "fill":
+                    cv2.rectangle(overlay, (x1, y1), (x2, y2), color, -1)
+                else:
+                    cv2.rectangle(overlay, (x1, y1), (x2, y2), color, 2)
+            out = cv2.addWeighted(overlay, alpha, out, 1.0 - alpha, 0)
 
     if settings.show_live_overlay and boxes:
         color = _hex_to_bgr(settings.live_overlay_color)

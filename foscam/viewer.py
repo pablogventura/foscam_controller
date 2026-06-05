@@ -48,6 +48,7 @@ from foscam.motion import (
     HeatmapAccumulator,
     MotionAnalyzer,
     MotionSettings,
+    ZonesOverlayCache,
     draw_motion_overlays,
     load_motion_settings,
     parse_motion_detect_zones,
@@ -55,7 +56,9 @@ from foscam.motion import (
     save_motion_to_prefs,
 )
 from foscam.display_pacing import (
+    OVERLAY_EVERY_N_FRAMES,
     READER_QUEUE_FULL_SLEEP_SEC,
+    cap_display_size,
     motion_analysis_needed,
     next_display_delay_ms,
     should_run_motion_analysis,
@@ -92,6 +95,8 @@ class _PreparedDisplay:
     stream_h: int
     display_label_w: int
     display_label_h: int
+    zoom_x: int = 1
+    zoom_y: int = 1
 
 
 def _load_viewer_prefs():
@@ -251,8 +256,16 @@ class FoscamViewer:
         self._display_fps = 0.0
         self._display_fps_window_start = time.monotonic()
         self._display_fps_window_count = 0
+        self._decode_fps = 0.0
+        self._decode_fps_window_start = time.monotonic()
+        self._decode_fps_window_count = 0
         self._last_motion_analysis_monotonic = 0.0
         self._motion_display_frame_index = 0
+        self._prep_frame_index = 0
+        self._photo_size = None
+        self._rgb_buffer_a = None
+        self._rgb_buffer_b = None
+        self._rgb_ping = False
         self._display_prep_stop = threading.Event()
         self._display_prep_thread = threading.Thread(
             target=self._display_prep_loop, daemon=True,
@@ -312,6 +325,7 @@ class FoscamViewer:
         self._motion_analyzer = MotionAnalyzer(self.motion_settings)
         self._auto_zoom = AutoZoomController(self.motion_settings)
         self._heatmap = HeatmapAccumulator(self.motion_settings.heatmap)
+        self._zones_overlay_cache = ZonesOverlayCache()
         self._md_info = None
         self._privacy_masks = []
         self._motion_boxes: list = []
@@ -1042,6 +1056,7 @@ class FoscamViewer:
             if info is None:
                 info = parsed
         self._md_info = info
+        self._zones_overlay_cache.invalidate()
         if info:
             self._auto_zoom.md_enabled = info.enabled
         if s.privacy_mask_overlay:
@@ -1141,7 +1156,6 @@ class FoscamViewer:
         s = self.motion_settings
         return motion_analysis_needed(
             show_live_overlay=s.show_live_overlay,
-            show_configured_zones=s.show_configured_zones,
             auto_zoom_enabled=s.auto_zoom.enabled,
             heatmap_enabled=s.heatmap.enabled,
             snapshot_enabled=s.snapshot_on_motion.enabled,
@@ -1189,13 +1203,17 @@ class FoscamViewer:
             scale = min(display_width / width, display_height / height)
             new_width = max(1, int(width * scale))
             new_height = max(1, int(height * scale))
-            interp = cv2.INTER_AREA if new_width < width else cv2.INTER_LINEAR
+            process_w, process_h = new_width, new_height
+            interp = cv2.INTER_AREA if process_w < width else cv2.INTER_LINEAR
             frame_resized = cv2.resize(
-                frame, (new_width, new_height), interpolation=interp,
+                frame, (process_w, process_h), interpolation=interp,
             )
+            zoom_x = zoom_y = 1
         else:
             frame_resized = frame
             new_width, new_height = frame.shape[1], frame.shape[0]
+            process_w, process_h = new_width, new_height
+            zoom_x = zoom_y = 1
 
         self.current_frame = frame
         self._maybe_update_motion(frame)
@@ -1206,8 +1224,8 @@ class FoscamViewer:
             crop = self._digital_crop
             sh, sw = frame.shape[:2]
             x1, y1, x2, y2 = crop
-            scale_x = new_width / max(1, sw)
-            scale_y = new_height / max(1, sh)
+            scale_x = process_w / max(1, sw)
+            scale_y = process_h / max(1, sh)
             cx1 = int(x1 * scale_x)
             cy1 = int(y1 * scale_y)
             cx2 = max(cx1 + 2, int(x2 * scale_x))
@@ -1215,13 +1233,18 @@ class FoscamViewer:
             cropped = display_frame[cy1:cy2, cx1:cx2]
             if cropped.size > 0:
                 display_frame = cv2.resize(
-                    cropped, (new_width, new_height), interpolation=cv2.INTER_LINEAR,
+                    cropped, (process_w, process_h), interpolation=cv2.INTER_LINEAR,
                 )
 
         if self.motion_settings.heatmap.enabled:
             display_frame = self._heatmap.overlay(display_frame)
 
-        if self._visual_overlays_needed():
+        self._prep_frame_index += 1
+        draw_overlays = (
+            self._visual_overlays_needed()
+            and (self._prep_frame_index % OVERLAY_EVERY_N_FRAMES == 0)
+        )
+        if draw_overlays:
             now = time.time()
             if self.motion_settings.flash_alarm_border and self._camera_alarm_active:
                 if now - self._alarm_flash_ts > 0.5:
@@ -1247,29 +1270,54 @@ class FoscamViewer:
                 self._privacy_masks if self.motion_settings.privacy_mask_overlay else None,
                 self._motion_level,
                 (src_w, src_h),
-                (new_width, new_height),
+                (process_w, process_h),
                 debug_text=debug_text,
                 alarm_flash=self._alarm_flash_on,
+                zones_cache=self._zones_overlay_cache,
             )
 
-        frame_rgb = cv2.cvtColor(display_frame, cv2.COLOR_BGR2RGB)
+        h, w = display_frame.shape[:2]
+        if (
+            self._rgb_buffer_a is None
+            or self._rgb_buffer_a.shape[0] != h
+            or self._rgb_buffer_a.shape[1] != w
+        ):
+            self._rgb_buffer_a = np.empty((h, w, 3), dtype=np.uint8)
+            self._rgb_buffer_b = np.empty((h, w, 3), dtype=np.uint8)
+        buf = self._rgb_buffer_a if self._rgb_ping else self._rgb_buffer_b
+        self._rgb_ping = not self._rgb_ping
+        cv2.cvtColor(display_frame, cv2.COLOR_BGR2RGB, dst=buf)
         return _PreparedDisplay(
-            rgb=frame_rgb,
+            rgb=buf,
             stream_w=width,
             stream_h=height,
             display_label_w=display_width,
             display_label_h=display_height,
+            zoom_x=zoom_x,
+            zoom_y=zoom_y,
         )
 
-    def _rgb_to_photoimage(self, rgb_array):
+    def _rgb_to_photoimage(self, rgb_array, existing=None, zoom_x=1, zoom_y=1):
         try:
             h, w = rgb_array.shape[:2]
+            if np is not None and not rgb_array.flags["C_CONTIGUOUS"]:
+                rgb_array = np.ascontiguousarray(rgb_array)
             header = f"P6 {w} {h} 255 ".encode("ascii")
             data = header + rgb_array.tobytes()
-            return tk.PhotoImage(master=self.root, data=data, format="PPM")
+            if existing is not None and self._photo_size == (w, h):
+                try:
+                    self.root.tk.call(existing.name, "put", data, "-format", "ppm", "-to", 0, 0)
+                    return existing
+                except tk.TclError:
+                    pass
+            photo = tk.PhotoImage(master=self.root, data=data, format="PPM")
+            self._photo_size = (w, h)
+            return photo
         except tk.TclError:
             image = Image.fromarray(rgb_array)
-            return ImageTk.PhotoImage(image=image, master=self.root)
+            photo = ImageTk.PhotoImage(image=image, master=self.root)
+            self._photo_size = (rgb_array.shape[1], rgb_array.shape[0])
+            return photo
 
     def _tick_display_fps(self) -> None:
         now = time.monotonic()
@@ -1279,8 +1327,14 @@ class FoscamViewer:
             self._display_fps = self._display_fps_window_count / elapsed
             self._display_fps_window_count = 0
             self._display_fps_window_start = now
+            if self.is_streaming:
+                print(
+                    f"[foscam] display_fps={self._display_fps:.1f}",
+                    file=sys.stderr,
+                    flush=True,
+                )
         if self.is_streaming and self._display_fps > 0:
-            self.ui.set_display_fps(self._display_fps)
+            self.ui.set_display_fps(self._display_fps, self._decode_fps)
 
     def _schedule_next_display(self, painted: bool) -> None:
         if not self._ui_active:
@@ -1959,12 +2013,28 @@ class FoscamViewer:
         finally:
             self._audio_process = None
     
+    def _tick_decode_fps(self) -> None:
+        now = time.monotonic()
+        self._decode_fps_window_count += 1
+        elapsed = now - self._decode_fps_window_start
+        if elapsed >= 0.5:
+            self._decode_fps = self._decode_fps_window_count / elapsed
+            self._decode_fps_window_count = 0
+            self._decode_fps_window_start = now
+            if self.is_streaming:
+                print(
+                    f"[foscam] decode_fps={self._decode_fps:.1f}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+
     def _video_reader_thread(self):
         """Thread to continuously read frames from RTSP stream."""
         while self.is_streaming and self.cap is not None:
             try:
                 ret, frame = self.cap.read()
                 if ret and frame is not None:
+                    self._tick_decode_fps()
                     try:
                         self.frame_queue.put_nowait(frame)
                     except queue.Full:
@@ -1973,8 +2043,6 @@ class FoscamViewer:
                             self.frame_queue.put_nowait(frame)
                         except queue.Empty:
                             pass
-                    if self.frame_queue.full():
-                        time.sleep(READER_QUEUE_FULL_SLEEP_SEC)
                 else:
                     # Stream ended or error
                     if self.is_streaming:
@@ -2024,9 +2092,14 @@ class FoscamViewer:
                     break
 
             if prepared is not None:
-                self._video_photo = self._rgb_to_photoimage(prepared.rgb)
-                self._last_image_size = (prepared.rgb.shape[1], prepared.rgb.shape[0])
-                self.video_label.configure(image=self._video_photo, text="")
+                prev = self._video_photo
+                size = (prepared.rgb.shape[1], prepared.rgb.shape[0])
+                self._video_photo = self._rgb_to_photoimage(
+                    prepared.rgb, prev, prepared.zoom_x, prepared.zoom_y,
+                )
+                self._last_image_size = size
+                if prev is not self._video_photo:
+                    self.video_label.configure(image=self._video_photo, text="")
                 self.video_label.image = self._video_photo
 
                 self.resolution_var.set(f"{prepared.stream_w}×{prepared.stream_h}")
@@ -2171,6 +2244,7 @@ class FoscamViewer:
         self._motion_analyzer.reset()
         self._auto_zoom.reset()
         self._heatmap.reset()
+        self._zones_overlay_cache.invalidate()
         self._digital_crop = None
         self._motion_level = 0.0
         self._motion_ema = 0.0
@@ -2215,12 +2289,14 @@ class FoscamViewer:
         self._display_fps = 0.0
         self._display_fps_window_count = 0
         self._motion_display_frame_index = 0
+        self._prep_frame_index = 0
         self.ui.set_display_fps(None)
 
         self.current_frame = None
         self.video_label.configure(image="", text="Desconectado")
         self.video_label.image = None
         self._video_photo = None
+        self._photo_size = None
         self._last_image_size = None
         self._set_connection_state("offline")
         self._set_status_short("Desconectado")
