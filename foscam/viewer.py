@@ -41,6 +41,17 @@ from foscam.audio_gate import (
     samples_db,
 )
 from foscam.client import FoscamClient
+from foscam.motion import (
+    AutoZoomController,
+    HeatmapAccumulator,
+    MotionAnalyzer,
+    MotionSettings,
+    draw_motion_overlays,
+    load_motion_settings,
+    parse_motion_detect_zones,
+    parse_osd_mask_areas,
+    save_motion_to_prefs,
+)
 from foscam.ui.shell import ViewerShell
 from foscam.ui import theme as ui_theme
 
@@ -80,6 +91,7 @@ def _load_viewer_prefs():
 
 def _save_viewer_prefs(
     volume, audio_gate_db, geometry=None, muted=None, volume_before_mute=None, ui_scale=None,
+    hud_mode=None, sidebar_collapsed=None,
 ):
     try:
         VIEWER_PREFS_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -95,6 +107,10 @@ def _save_viewer_prefs(
             data["volume_before_mute"] = int(volume_before_mute)
         if ui_scale is not None:
             data["ui_scale"] = float(ui_scale)
+        if hud_mode is not None:
+            data["hud_mode"] = str(hud_mode)
+        if sidebar_collapsed is not None:
+            data["sidebar_collapsed"] = bool(sidebar_collapsed)
         try:
             if VIEWER_PREFS_PATH.is_file():
                 with open(VIEWER_PREFS_PATH, encoding="utf-8") as f:
@@ -153,8 +169,10 @@ class FoscamViewer:
         use_sub_stream=False, audio_gate_db=None, use_nvidia_decode=False,
         nvidia_source="off", initial_volume=None, ui_scale=None,
         audio_gate_debug=False,
+        motion_cli_overrides=None,
     ):
         prefs = _load_viewer_prefs()
+        self.motion_settings = load_motion_settings(prefs, motion_cli_overrides)
         self.ui_scale = float(
             ui_scale if ui_scale is not None
             else prefs.get("ui_scale", ui_theme.DEFAULT_UI_SCALE)
@@ -171,6 +189,10 @@ class FoscamViewer:
         saved_vol = int(prefs.get("volume", 50))
         self._volume_before_mute = int(prefs.get("volume_before_mute", saved_vol if saved_vol > 0 else 50))
         self._fullscreen = False
+        self._hud_mode = str(prefs.get("hud_mode", "full"))
+        if self._hud_mode not in ("full", "minimal"):
+            self._hud_mode = "full"
+        self._sidebar_collapsed = bool(prefs.get("sidebar_collapsed", False))
         self._video_photo = None
         self._last_image_size = None
         self._display_frame_count = 0
@@ -258,11 +280,22 @@ class FoscamViewer:
         self._camera_alarm_active = None  # None = N/D, True/False
         self._cgi_poll_stop = threading.Event()
         self._cgi_poll_thread = None
+        self._motion_analyzer = MotionAnalyzer(self.motion_settings)
+        self._auto_zoom = AutoZoomController(self.motion_settings)
+        self._heatmap = HeatmapAccumulator(self.motion_settings.heatmap)
+        self._md_info = None
+        self._privacy_masks = []
+        self._motion_boxes: list = []
+        self._zones_last_refresh = 0.0
+        self._alarm_flash_on = False
+        self._alarm_flash_ts = 0.0
         # Create GUI
         self._create_widgets()
         self._start_cgi_motion_poll()
-        
-        # Bind close event
+        self._digital_crop = None
+        self._start_auto_zoom_tick()
+        self._refresh_motion_zones(force=True)
+        threading.Thread(target=self._probe_camera_motion_caps, daemon=True).start()
         self.root.protocol("WM_DELETE_WINDOW", self._on_closing)
         
         # PTZ: bind arrow keys (move on press, stop on release)
@@ -308,7 +341,14 @@ class FoscamViewer:
             on_ptz_stop=self._ptz_stop,
             on_toggle_details=self._toggle_details_panel,
             on_toggle_help=self._toggle_help_panel,
+            on_toggle_hud=self._toggle_hud,
+            on_toggle_sidebar=self._toggle_sidebar_collapsed,
+            motion=self._motion_ui_dict(),
+            on_motion_change=self._on_motion_setting,
         )
+        self.ui.set_hud_mode(self._hud_mode)
+        if self._sidebar_collapsed:
+            self.ui.set_sidebar_collapsed(True)
         self.video_label = self.ui.video_label
         self.status_var = self.ui.status_var
         self.resolution_var = self.ui.resolution_var
@@ -332,6 +372,8 @@ class FoscamViewer:
         self._set_connection_state("connecting")
         self._update_audio_meter_enabled()
         self.vu_meter.set_gate_db(self.audio_gate_db)
+        self.ui.sidebar_mini_vu.set_gate_db(self.audio_gate_db)
+        self.ui.indicator_strip.vu_meter.set_gate_db(self.audio_gate_db)
         self._update_technical_details()
         self._update_display_loop()
         self._meter_ui_loop()
@@ -343,11 +385,11 @@ class FoscamViewer:
         self.volume_var.set(f"Vol: {vol}")
 
     def _set_connection_state(self, state: str) -> None:
-        self.ui.status_pill.set_state(state)
+        self.ui.set_connection_state(state)
         if state == "reconnecting":
-            self.reconnect_banner.show()
+            self.ui.show_reconnect_banner()
         else:
-            self.reconnect_banner.hide()
+            self.ui.hide_reconnect_banner()
 
     def _set_status_short(self, text: str) -> None:
         self.status_var.set(text)
@@ -403,24 +445,21 @@ class FoscamViewer:
 
     def _toggle_fullscreen(self, _event=None) -> None:
         self._fullscreen = not self._fullscreen
-        if self._fullscreen:
-            for w in (self.ui.toolbar, self.ui.sidebar, self.ui.footer):
-                w.pack_forget()
-            if self.ui._details_open:
-                self.ui.details_panel.pack_forget()
-            if self.ui._help_open:
-                self.ui.help_panel.pack_forget()
-            self.ui.content.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
-            self.ui.set_ptz_hint_visible(False)
-        else:
-            self.ui.set_ptz_hint_visible(True)
-            self.ui.toolbar.pack(side=tk.TOP, fill=tk.X)
-            self.ui.content.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
-            self.ui.footer.pack(side=tk.BOTTOM, fill=tk.X)
-            if self.ui._details_open:
-                self.ui.details_panel.pack(side=tk.BOTTOM, fill=tk.X, before=self.ui.footer)
-            if self.ui._help_open:
-                self.ui.help_panel.pack(side=tk.BOTTOM, fill=tk.X, before=self.ui.footer)
+        try:
+            self.root.attributes("-fullscreen", self._fullscreen)
+        except tk.TclError:
+            self.root.attributes("-zoomed", self._fullscreen)
+        self.ui._apply_hud_layout()
+
+    def _toggle_hud(self) -> None:
+        self.ui.toggle_hud()
+        self._hud_mode = self.ui.hud_mode
+        self._schedule_save_prefs()
+
+    def _toggle_sidebar_collapsed(self) -> None:
+        self.ui.toggle_sidebar_collapsed()
+        self._sidebar_collapsed = self.ui.sidebar_collapsed
+        self._schedule_save_prefs()
 
     def _apply_gate_preset(self, db: float) -> None:
         self.audio_gate_db = float(db)
@@ -439,14 +478,25 @@ class FoscamViewer:
         try:
             geom = self.root.geometry()
             vol_save = self._volume_before_mute if self._muted else self._playback_volume
-            _save_viewer_prefs(
-                vol_save, self.audio_gate_db,
-                geometry=geom, muted=self._muted,
-                volume_before_mute=self._volume_before_mute,
-                ui_scale=self.ui_scale,
-            )
+            self._save_viewer_prefs_now(geometry=geom)
         except tk.TclError:
             pass
+
+    def _save_viewer_prefs_now(self, geometry=None):
+        try:
+            geom = geometry or self.root.geometry()
+        except tk.TclError:
+            geom = None
+        vol_save = self._volume_before_mute if self._muted else self._playback_volume
+        _save_viewer_prefs(
+            vol_save, self.audio_gate_db,
+            geometry=geom, muted=self._muted,
+            volume_before_mute=self._volume_before_mute,
+            ui_scale=self.ui_scale,
+            hud_mode=self._hud_mode,
+            sidebar_collapsed=self._sidebar_collapsed,
+        )
+        save_motion_to_prefs(VIEWER_PREFS_PATH, self.motion_settings)
 
     def _samples_db(self, samples) -> float:
         if np is None:
@@ -524,18 +574,27 @@ class FoscamViewer:
         )
         if pyav_audio or ffplay_meter:
             self.vu_meter.set_enabled(True)
+            self.ui.indicator_strip.vu_meter.set_enabled(True)
+            self.ui.sidebar_mini_vu.set_enabled(True)
             if not pyav_audio and ffplay_meter:
                 self._audio_level_label_var.set("— dB (demux aux.)")
+                self.ui.indicator_strip._audio_level_label_var.set("— dB (demux aux.)")
             else:
                 self._audio_level_label_var.set("— dB")
+                self.ui.indicator_strip._audio_level_label_var.set("— dB")
         else:
             self.vu_meter.set_enabled(False)
+            self.ui.indicator_strip.vu_meter.set_enabled(False)
+            self.ui.sidebar_mini_vu.set_enabled(False)
             if not AUDIO_AVAILABLE:
-                self._audio_level_label_var.set("Sin audio")
+                label = "Sin audio"
             elif not PYAV_AUDIO_AVAILABLE:
-                self._audio_level_label_var.set("Requiere PyAV")
+                label = "Requiere PyAV"
             else:
-                self._audio_level_label_var.set("Sin stream de audio")
+                label = "Sin stream de audio"
+            self._audio_level_label_var.set(label)
+            self.ui.indicator_strip._audio_level_label_var.set(label)
+            self.ui._sidebar_mini_db_var.set(label)
 
     def _schedule_save_prefs(self):
         if self._prefs_save_after_id is not None:
@@ -546,17 +605,7 @@ class FoscamViewer:
 
     def _do_save_prefs(self):
         self._prefs_save_after_id = None
-        try:
-            geom = self.root.geometry()
-        except tk.TclError:
-            geom = None
-        vol_save = self._volume_before_mute if self._muted else self._playback_volume
-        _save_viewer_prefs(
-            vol_save, self.audio_gate_db,
-            geometry=geom, muted=self._muted,
-            volume_before_mute=self._volume_before_mute,
-            ui_scale=self.ui_scale,
-        )
+        self._save_viewer_prefs_now()
 
     def _on_volume_slider(self, value=None):
         vol = int(round(float(value if value is not None else self._vol_slider.get())))
@@ -579,6 +628,8 @@ class FoscamViewer:
         self.audio_gate_db = float(value if value is not None else self._gate_slider.get())
         self._gate_label_var.set(f"{self.audio_gate_db:.0f} dB")
         self.vu_meter.set_gate_db(self.audio_gate_db)
+        self.ui.sidebar_mini_vu.set_gate_db(self.audio_gate_db)
+        self.ui.indicator_strip.vu_meter.set_gate_db(self.audio_gate_db)
         self.ui.highlight_gate_preset(self.audio_gate_db)
         self._schedule_save_prefs()
         self._update_technical_details()
@@ -819,47 +870,294 @@ class FoscamViewer:
                 except Exception:
                     pass
 
+    def _motion_ui_dict(self):
+        s = self.motion_settings
+        az = s.auto_zoom
+        return {
+            "show_live_overlay": s.show_live_overlay,
+            "show_configured_zones": s.show_configured_zones,
+            "auto_zoom_enabled": az.enabled,
+            "sensitivity": s.sensitivity,
+            "trigger_level": s.trigger_level,
+            "trigger_hold_sec": s.trigger_hold_sec,
+            "auto_zoom_return_sec": az.return_sec,
+            "auto_zoom_mode": az.mode,
+            "auto_zoom_ptz_speed": az.ptz_speed,
+            "auto_zoom_max_digital": az.max_digital,
+            "live_overlay_style": s.live_overlay_style,
+            "zones_config_source": s.zones_config_source,
+            "snapshot_dir": s.snapshot_on_motion.dir,
+            "heatmap_decay_sec": s.heatmap.decay_sec,
+            "show_legend": s.show_legend,
+            "active_profile": s.active_profile,
+            "profile_names": list(s.profiles.keys()),
+            "debug_fsm_overlay": s.debug_fsm_overlay,
+            "ignore_camera_md_disabled": s.ignore_camera_md_disabled,
+            "require_audio_gate": s.require_audio_gate,
+            "ignore_zones_outside_md": s.ignore_zones_outside_md,
+            "flash_alarm_border": s.flash_alarm_border,
+            "privacy_mask_overlay": s.privacy_mask_overlay,
+            "auto_zoom": {
+                "return_use_ptz_reset": az.return_use_ptz_reset,
+                "return_use_zoom_out": az.return_use_zoom_out,
+                "max_digital": az.max_digital,
+            },
+            "heatmap": {"enabled": s.heatmap.enabled, "decay_sec": s.heatmap.decay_sec},
+            "snapshot_on_motion": {
+                "enabled": s.snapshot_on_motion.enabled,
+                "dir": s.snapshot_on_motion.dir,
+            },
+        }
+
+    def _sync_motion_ui(self) -> None:
+        self.ui.sync_motion_from_settings(self._motion_ui_dict())
+
+    def _set_motion_nested(self, key: str, value) -> None:
+        if key == "preset":
+            self.motion_settings.apply_preset(str(value))
+            self._motion_analyzer.settings = self.motion_settings
+            self._auto_zoom.settings = self.motion_settings
+            return
+        if key == "active_profile":
+            if value:
+                self.motion_settings.apply_profile(str(value))
+            else:
+                self.motion_settings.active_profile = None
+            self._motion_analyzer.settings = self.motion_settings
+            self._auto_zoom.settings = self.motion_settings
+            return
+        if key.startswith("auto_zoom."):
+            setattr(self.motion_settings.auto_zoom, key.split(".", 1)[1], value)
+            self._auto_zoom.settings = self.motion_settings
+            return
+        if key.startswith("heatmap."):
+            setattr(self.motion_settings.heatmap, key.split(".", 1)[1], value)
+            self._heatmap.settings = self.motion_settings.heatmap
+            return
+        if key.startswith("snapshot_on_motion."):
+            setattr(self.motion_settings.snapshot_on_motion, key.split(".", 1)[1], value)
+            return
+        if hasattr(self.motion_settings, key):
+            setattr(self.motion_settings, key, value)
+            self._motion_analyzer.settings = self.motion_settings
+            self._auto_zoom.settings = self.motion_settings
+
+    def _on_motion_setting(self, key: str, value) -> None:
+        if key == "refresh_zones":
+            self._refresh_motion_zones(force=True)
+            return
+        if key == "test_ptz":
+            self._test_ptz_capabilities()
+            return
+        if key == "save_profile_prompt":
+            self._prompt_save_motion_profile()
+            return
+        if key == "delete_profile":
+            name = value
+            if not name or name == "(ninguno)":
+                return
+            if self.motion_settings.delete_profile(name):
+                self.ui.set_motion_profile_names(
+                    list(self.motion_settings.profiles.keys()),
+                    self.motion_settings.active_profile,
+                )
+                self._schedule_save_prefs()
+            return
+        self._set_motion_nested(key, value)
+        if key in ("preset", "active_profile"):
+            self._sync_motion_ui()
+        if key == "privacy_mask_overlay" and value:
+            self._refresh_motion_zones(force=True)
+        if key in ("show_live_overlay", "show_configured_zones", "auto_zoom.enabled"):
+            self.ui.sync_motion_toggles(
+                self.motion_settings.show_live_overlay,
+                self.motion_settings.show_configured_zones,
+                self.motion_settings.auto_zoom.enabled,
+            )
+        self._schedule_save_prefs()
+
+    def _prompt_save_motion_profile(self) -> None:
+        dialog = ctk.CTkInputDialog(text="Nombre del perfil:", title="Guardar perfil movimiento")
+        name = dialog.get_input()
+        if not name or not str(name).strip():
+            return
+        name = str(name).strip()
+        self.motion_settings.save_profile(name)
+        self.ui.set_motion_profile_names(list(self.motion_settings.profiles.keys()), name)
+        self._sync_motion_ui()
+        self._schedule_save_prefs()
+
+    def _refresh_motion_zones(self, force: bool = False) -> None:
+        s = self.motion_settings
+        now = time.time()
+        if not force and s.zones_refresh_sec > 0 and (now - self._zones_last_refresh) < s.zones_refresh_sec:
+            return
+        self._zones_last_refresh = now
+        source = s.zones_config_source
+        variants = ["config", "config1", "config2"] if source == "auto" else [source.replace("config", "config") if source.startswith("config") else source]
+        if source == "auto":
+            variants = ["config", "config1", "config2"]
+        elif source in ("config", "config1", "config2"):
+            variants = [source]
+        else:
+            variants = ["config"]
+        info = None
+        for variant in variants:
+            xml_text = self._cgi_client.get_motion_detect_config(variant)
+            if not xml_text:
+                continue
+            parsed = parse_motion_detect_zones(xml_text)
+            if parsed.zones or parsed.grid:
+                info = parsed
+                break
+            if info is None:
+                info = parsed
+        self._md_info = info
+        if info:
+            self._auto_zoom.md_enabled = info.enabled
+        if s.privacy_mask_overlay:
+            mask_xml = self._cgi_client.get_osd_mask_area()
+            self._privacy_masks = parse_osd_mask_areas(mask_xml or "")
+        else:
+            self._privacy_masks = []
+
+    def _probe_camera_motion_caps(self) -> None:
+        try:
+            has_ptz, has_optical = self._cgi_client.probe_ptz_capabilities()
+        except Exception:
+            has_ptz, has_optical = False, False
+        self._auto_zoom.has_ptz = has_ptz
+        self._auto_zoom.has_optical_zoom = has_optical
+        az = self.motion_settings.auto_zoom
+        if has_ptz and az.ptz_speed is not None:
+            try:
+                self._cgi_client.set_ptz_speed(int(az.ptz_speed))
+            except Exception:
+                pass
+        self.root.after(0, lambda: self.ui.set_motion_ptz_caps(has_ptz, has_optical))
+
+    def _test_ptz_capabilities(self) -> None:
+        def worker():
+            try:
+                self._cgi_client.ptz_move("Right")
+                time.sleep(0.2)
+                self._cgi_client.ptz_stop()
+                self._cgi_client.zoom_in()
+                time.sleep(0.25)
+                self._cgi_client.zoom_stop()
+                self._cgi_client.zoom_out()
+                time.sleep(0.25)
+                self._cgi_client.zoom_stop()
+            except Exception:
+                pass
+            self._probe_camera_motion_caps()
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _save_motion_snapshot(self, frame) -> None:
+        snap = self.motion_settings.snapshot_on_motion
+        if not snap.enabled or frame is None:
+            return
+        try:
+            dest = Path(snap.dir).expanduser()
+            dest.mkdir(parents=True, exist_ok=True)
+            ts = time.strftime("%Y%m%d_%H%M%S")
+            path = dest / f"motion_{self.camera_ip}_{ts}.jpg"
+            cv2.imwrite(str(path), frame)
+        except Exception:
+            pass
+
+    def _start_auto_zoom_tick(self) -> None:
+        self.root.after(200, self._auto_zoom_tick)
+
+    def _auto_zoom_tick(self) -> None:
+        if not self._ui_active:
+            return
+        try:
+            frame = self.current_frame
+            if frame is None:
+                pass
+            else:
+                fh, fw = frame.shape[:2]
+                gate_open = True
+                if self.motion_settings.require_audio_gate:
+                    gate_open = bool(self._gate_is_open(for_playback=False))
+                action = self._auto_zoom.tick(
+                    self._motion_level, self._motion_boxes, (fw, fh), gate_open,
+                )
+                for cmd, params in action.ptz_commands:
+                    self._ptz_cgi(cmd, params)
+                self._digital_crop = action.digital_crop
+                if action.snapshot and frame is not None:
+                    self._save_motion_snapshot(frame)
+                if self.motion_settings.auto_zoom.show_state_badge:
+                    self.ui.set_motion_zoom_state(action.state_label)
+                    self.ui.indicator_strip.set_zoom_state(action.state_label)
+        except Exception:
+            pass
+        if self._ui_active:
+            try:
+                self.root.after(100, self._auto_zoom_tick)
+            except tk.TclError:
+                pass
+
     def _compute_motion_level(self, frame):
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        small = cv2.resize(gray, MOTION_FRAME_SIZE, interpolation=cv2.INTER_AREA)
-        if self._prev_gray is None:
-            self._prev_gray = small
-            return 0.0
-        diff = cv2.absdiff(self._prev_gray, small)
-        self._prev_gray = small
-        raw = float(cv2.mean(diff)[0])
-        # Escala empírica: diff medio ~0–25 suele ser poco/mucho movimiento
-        instant = max(0.0, min(100.0, (raw / 25.0) * 100.0))
-        self._motion_ema = (
-            METER_EMA_ALPHA * instant + (1.0 - METER_EMA_ALPHA) * self._motion_ema
-        )
-        return self._motion_ema
+        level, boxes = self._motion_analyzer.analyze_with_zones(frame, self._md_info)
+        self._motion_ema = level
+        self._motion_boxes = boxes
+        if self.motion_settings.heatmap.enabled and frame is not None:
+            self._heatmap.update(frame.shape, boxes)
+        return level
 
     def _meter_ui_loop(self):
         try:
-            self.vu_meter.redraw_db(self._audio_level_db_ema)
+            level_db = self._audio_level_db_ema
             gate_db = self.audio_gate_db
-            above = self._audio_level_db_ema >= gate_db if gate_db > GATE_SLIDER_MIN + 1 else True
+            above = level_db >= gate_db if gate_db > GATE_SLIDER_MIN + 1 else True
             hint = "≥ umbral" if above else "< umbral"
-            self._audio_level_label_var.set(
-                f"{self._audio_level_db_ema:.1f} dB {hint} ({gate_db:.0f} dB)",
-            )
+            level_text = f"{level_db:.1f} dB {hint} ({gate_db:.0f} dB)"
+
+            self.vu_meter.redraw_db(level_db)
+            self.vu_meter.set_gate_db(gate_db)
+            self._audio_level_label_var.set(level_text)
+
+            strip = self.ui.indicator_strip
+            strip.vu_meter.redraw_db(level_db)
+            strip.vu_meter.set_gate_db(gate_db)
+            strip._audio_level_label_var.set(level_text)
+
+            mini = getattr(self.ui, "sidebar_mini_vu", None)
+            if mini is not None:
+                mini.redraw_db(level_db)
+                mini.set_gate_db(gate_db)
+                self.ui._sidebar_mini_db_var.set(f"{level_db:.0f} dB")
+
             if self._uses_live_audio_gate():
                 self.ui.set_gate_state(self._gate_open_state)
             else:
                 self.ui.set_gate_state(self._gate_is_open(for_playback=False))
-            self._motion_meter.set(self._motion_level / 100.0)
+
+            motion_ratio = self._motion_level / 100.0
+            self._motion_meter.set(motion_ratio)
+            strip._motion_meter.set(motion_ratio)
+            self.ui._sidebar_mini_motion.set(motion_ratio)
+
             if self._camera_alarm_active is None:
                 self._camera_alarm_meter.set(0)
                 self._camera_alarm_label_var.set("N/D")
+                strip._camera_alarm_meter.set(0)
+                strip._camera_alarm_label_var.set("N/D")
                 self.ui.set_alarm_badge(None)
             elif self._camera_alarm_active:
                 self._camera_alarm_meter.set(1.0)
                 self._camera_alarm_label_var.set("Activa")
+                strip._camera_alarm_meter.set(1.0)
+                strip._camera_alarm_label_var.set("Activa")
                 self.ui.set_alarm_badge(True)
             else:
                 self._camera_alarm_meter.set(0)
                 self._camera_alarm_label_var.set("Inactiva")
+                strip._camera_alarm_meter.set(0)
+                strip._camera_alarm_label_var.set("Inactiva")
                 self.ui.set_alarm_badge(False)
         except tk.TclError:
             return
@@ -903,6 +1201,7 @@ class FoscamViewer:
                     if parsed is not None:
                         active = parsed
                         break
+                self._refresh_motion_zones(force=False)
             except Exception:
                 pass
             self._camera_alarm_active = active
@@ -928,6 +1227,15 @@ class FoscamViewer:
         self.root.bind("<KeyPress>", self._on_any_keypress)
         self.root.bind("<F11>", self._toggle_fullscreen)
         self.root.bind("<Escape>", lambda e: self._exit_fullscreen_if_active())
+        self.root.bind("h", lambda e: self._toggle_hud())
+        self.root.bind("H", lambda e: self._toggle_hud())
+        self.root.bind("[", lambda e: self._toggle_sidebar_collapsed())
+        self.root.bind("]", lambda e: self._toggle_sidebar_collapsed())
+        self.root.bind("m", lambda e: self._toggle_motion_shortcut("show_live_overlay"))
+        self.root.bind("M", lambda e: self._toggle_motion_shortcut("show_live_overlay"))
+        self.root.bind("v", lambda e: self._toggle_motion_shortcut("show_configured_zones"))
+        self.root.bind("V", lambda e: self._toggle_motion_shortcut("show_configured_zones"))
+        self.root.bind("Z", lambda e: self._toggle_motion_shortcut("auto_zoom.enabled"))
         self.root.focus_set()
         self.root.bind("<FocusIn>", lambda e: self.root.focus_set())
 
@@ -959,8 +1267,20 @@ class FoscamViewer:
         except queue.Full:
             pass
     
+    def _toggle_motion_shortcut(self, key: str) -> None:
+        if key == "auto_zoom.enabled":
+            val = not self.motion_settings.auto_zoom.enabled
+        elif key == "show_live_overlay":
+            val = not self.motion_settings.show_live_overlay
+        elif key == "show_configured_zones":
+            val = not self.motion_settings.show_configured_zones
+        else:
+            return
+        self._on_motion_setting(key, val)
+
     def _ptz_move(self, cmd):
         """Start PTZ movement (arrow key pressed). Only one move command per press (ignore key repeat)."""
+        self._auto_zoom.notify_manual_ptz()
         if self._ptz_direction is not None:
             return  # Already moving in some direction, ignore repeat
         self._ptz_direction = cmd
@@ -972,12 +1292,12 @@ class FoscamViewer:
         self._ptz_cgi("ptzStopRun")
 
     def _on_any_keypress(self, event):
-        """Tecla 0: ptzReset. a: subir volumen, z: bajar volumen (reproducción ffplay)."""
+        """Tecla 0: ptzReset. a/s: volumen. Z: zoom auto (bind directo)."""
         if event.keysym in ("0", "KP_0") or getattr(event, "keycode", None) == 96:
             self._ptz_reset()
         elif event.keysym in ("a", "A"):
             self._volume_change(1)
-        elif event.keysym in ("z", "Z"):
+        elif event.keysym in ("s", "S"):
             self._volume_change(-1)
 
     def _volume_change(self, delta):
@@ -1457,7 +1777,8 @@ class FoscamViewer:
     
     def _on_display_resize(self, event):
         """When window/display area is resized, use new size for scaling only (no automatic resolution change)."""
-        if event.widget != self.video_label or event.width < 2 or event.height < 2:
+        label = getattr(self, "video_label", None)
+        if label is None or event.widget != label or event.width < 2 or event.height < 2:
             return
         self._display_size = (event.width, event.height)
 
@@ -1491,7 +1812,61 @@ class FoscamViewer:
                     frame_resized = frame
                     new_width, new_height = frame.shape[1], frame.shape[0]
 
-                frame_rgb = cv2.cvtColor(frame_resized, cv2.COLOR_BGR2RGB)
+                self.current_frame = frame
+                self._motion_level = self._compute_motion_level(frame)
+                src_h, src_w = frame.shape[:2]
+
+                display_frame = frame_resized
+                if getattr(self, "_digital_crop", None) is not None:
+                    crop = self._digital_crop
+                    sh, sw = frame.shape[:2]
+                    x1, y1, x2, y2 = crop
+                    scale_x = new_width / max(1, sw)
+                    scale_y = new_height / max(1, sh)
+                    cx1 = int(x1 * scale_x)
+                    cy1 = int(y1 * scale_y)
+                    cx2 = max(cx1 + 2, int(x2 * scale_x))
+                    cy2 = max(cy1 + 2, int(y2 * scale_y))
+                    cropped = display_frame[cy1:cy2, cx1:cx2]
+                    if cropped.size > 0:
+                        display_frame = cv2.resize(
+                            cropped, (new_width, new_height), interpolation=cv2.INTER_LINEAR,
+                        )
+
+                if self.motion_settings.heatmap.enabled:
+                    display_frame = self._heatmap.overlay(display_frame)
+
+                now = time.time()
+                if self.motion_settings.flash_alarm_border and self._camera_alarm_active:
+                    if now - self._alarm_flash_ts > 0.5:
+                        self._alarm_flash_on = not self._alarm_flash_on
+                        self._alarm_flash_ts = now
+                else:
+                    self._alarm_flash_on = False
+
+                debug_text = None
+                if self.motion_settings.debug_fsm_overlay:
+                    az = self._auto_zoom
+                    debug_text = (
+                        f"{az.state.value} | {self._motion_level:.0f}% | "
+                        f"boxes={len(self._motion_boxes)} | "
+                        f"ptz={az.has_ptz} opt={az.has_optical_zoom}"
+                    )
+
+                display_frame = draw_motion_overlays(
+                    display_frame,
+                    self.motion_settings,
+                    self._motion_boxes,
+                    self._md_info,
+                    self._privacy_masks if self.motion_settings.privacy_mask_overlay else None,
+                    self._motion_level,
+                    (src_w, src_h),
+                    (new_width, new_height),
+                    debug_text=debug_text,
+                    alarm_flash=self._alarm_flash_on,
+                )
+
+                frame_rgb = cv2.cvtColor(display_frame, cv2.COLOR_BGR2RGB)
                 image = Image.fromarray(frame_rgb)
                 size = (new_width, new_height)
                 self._video_photo = ImageTk.PhotoImage(image=image)
@@ -1499,8 +1874,6 @@ class FoscamViewer:
                 self.video_label.configure(image=self._video_photo, text="")
                 self.video_label.image = self._video_photo
 
-                self.current_frame = frame
-                self._motion_level = self._compute_motion_level(frame)
                 h, w = frame.shape[:2]
                 self.resolution_var.set(f"{w}×{h}")
                 if display_width > 1 and display_height > 1:
@@ -1640,6 +2013,10 @@ class FoscamViewer:
         self._cgi_poll_stop.set()
         self._stop_audio_level_meter()
         self._prev_gray = None
+        self._motion_analyzer.reset()
+        self._auto_zoom.reset()
+        self._heatmap.reset()
+        self._digital_crop = None
         self._motion_level = 0.0
         self._motion_ema = 0.0
         self._audio_level = 0.0
@@ -1725,6 +2102,10 @@ class FoscamViewer:
         except tk.TclError:
             pass
         self._disconnect_camera()
+        try:
+            self.ui.destroy_overlays()
+        except (tk.TclError, AttributeError):
+            pass
         try:
             self.root.destroy()
         except tk.TclError:
@@ -1821,6 +2202,24 @@ Sin ellos se usa ffplay en subproceso (sin sync perfecto).
             'Ej: 1.5, 2.0, 2.5. Afecta controles y tamaño sugerido de ventana.'
         ),
     )
+
+    motion_group = parser.add_argument_group('movimiento y zoom')
+    motion_group.add_argument('--motion-live-overlay', action='store_true', help='Activar overlay de movimiento en vivo')
+    motion_group.add_argument('--no-motion-live-overlay', action='store_true', help='Desactivar overlay de movimiento')
+    motion_group.add_argument('--motion-zones-overlay', action='store_true', help='Mostrar zonas MD de la cámara')
+    motion_group.add_argument('--no-motion-zones-overlay', action='store_true', help='Ocultar zonas MD')
+    motion_group.add_argument('--auto-zoom', action='store_true', help='Activar zoom automático al movimiento')
+    motion_group.add_argument('--no-auto-zoom', action='store_true', help='Desactivar zoom automático')
+    motion_group.add_argument('--motion-sensitivity', type=float, default=None, metavar='0-100')
+    motion_group.add_argument('--auto-zoom-return-sec', type=float, default=None, metavar='SEC')
+    motion_group.add_argument(
+        '--auto-zoom-mode',
+        choices=['auto', 'digital', 'ptz', 'ptz_pan_digital_zoom'],
+        default=None,
+    )
+    motion_group.add_argument('--motion-profile', type=str, default=None, metavar='NAME')
+    motion_group.add_argument('--motion-config', type=str, default=None, metavar='PATH',
+                              help='JSON parcial con claves motion para merge al arrancar')
     
     args = parser.parse_args()
     
@@ -1845,6 +2244,39 @@ Sin ellos se usa ffplay en subproceso (sin sync perfecto).
     else:
         use_nvidia = False
         nvidia_source = "off"
+
+    motion_cli = {}
+    if args.motion_live_overlay:
+        motion_cli["show_live_overlay"] = True
+    if args.no_motion_live_overlay:
+        motion_cli["show_live_overlay"] = False
+    if args.motion_zones_overlay:
+        motion_cli["show_configured_zones"] = True
+    if args.no_motion_zones_overlay:
+        motion_cli["show_configured_zones"] = False
+    if args.auto_zoom:
+        motion_cli.setdefault("auto_zoom", {})["enabled"] = True
+    if args.no_auto_zoom:
+        motion_cli.setdefault("auto_zoom", {})["enabled"] = False
+    if args.motion_sensitivity is not None:
+        motion_cli["sensitivity"] = float(args.motion_sensitivity)
+    if args.auto_zoom_return_sec is not None:
+        motion_cli.setdefault("auto_zoom", {})["return_sec"] = float(args.auto_zoom_return_sec)
+    if args.auto_zoom_mode:
+        motion_cli.setdefault("auto_zoom", {})["mode"] = args.auto_zoom_mode
+    if args.motion_profile:
+        motion_cli["active_profile"] = args.motion_profile
+    if args.motion_config:
+        try:
+            with open(args.motion_config, encoding="utf-8") as f:
+                extra = json.load(f)
+            if isinstance(extra, dict):
+                from foscam.motion import _merge_dict
+                motion_cli = _merge_dict(motion_cli, extra.get("motion", extra))
+        except (OSError, json.JSONDecodeError, TypeError) as e:
+            print(f"Error leyendo --motion-config: {e}", file=sys.stderr)
+            sys.exit(1)
+
     ui_theme.apply_theme(float(ui_scale))
     root = ctk.CTk()
     app = FoscamViewer(
@@ -1855,6 +2287,7 @@ Sin ellos se usa ffplay en subproceso (sin sync perfecto).
         nvidia_source=nvidia_source,
         ui_scale=ui_scale,
         audio_gate_debug=getattr(args, "audio_gate_debug", False),
+        motion_cli_overrides=motion_cli or None,
     )
     root.mainloop()
 

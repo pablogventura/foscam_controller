@@ -110,7 +110,9 @@ Interfaz: barra superior (estado, captura, silenciar), vídeo con cruceta PTZ, p
 | Movimiento (imagen) | Cambio entre frames |
 | Alarma cámara | Estado vía CGI; puede mostrar N/D según modelo |
 
-Preferencias en `~/.config/foscam-controller/viewer.json`: volumen, umbral, geometría, silenciado, `ui_scale` (default **2.0**).
+Preferencias en `~/.config/foscam-controller/viewer.json`: volumen, umbral, geometría, silenciado, `ui_scale` (default **2.0**), `hud_mode` (`full` / `minimal`), `sidebar_collapsed`.
+
+El visor usa **HUD overlay**: el vídeo ocupa toda la ventana y los controles flotan encima con **transparencia real** (~38 % opaco en reposo; ~93 % al pasar el ratón). Por defecto se muestra el HUD completo (toolbar, panel lateral, footer). Tecla **H** alterna al **modo indicadores** (VU, puerta, movimiento, alarma, estado). Teclas **`[`** / **`]`** colapsan o expanden el panel lateral.
 
 Escala de interfaz: `foscam view ... --ui-scale 1.5` (o `2.5`). Sin argumento usa `ui_scale` guardado o 2.0.
 
@@ -122,7 +124,9 @@ Atajos:
 | Cruceta   | PTZ con ratón (mantener/soltar)|
 | 0         | Preset por defecto         |
 | a / z     | Subir / bajar volumen      |
-| F11       | Pantalla completa          |
+| H         | HUD completo ↔ indicadores |
+| [ / ]     | Colapsar / expandir panel  |
+| F11       | Pantalla completa (mantiene HUD) |
 | Esc       | Salir de pantalla completa |
 
 Ejecutar el visor como módulo (sin usar el CLI):
