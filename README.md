@@ -97,12 +97,15 @@ foscam apply --ip 192.168.1.7 --user admin --password xxx --file cam.json
 foscam view --ip 192.168.1.6 --user admin --password xxx [--port 88] [--sub] [--nvidia] [--audio-gate-db -38]
 ```
 
+Con GPU NVIDIA y `nvh264dec` disponible, el visor **activa decodificación NVIDIA automáticamente** (vídeo por GPU, audio por sidecar PyAV con umbral en vivo). `--no-nvidia` fuerza CPU; `--nvidia` fuerza GPU.
+
 Interfaz: barra superior (estado, captura, silenciar), vídeo con cruceta PTZ, panel **AUDIO** / **SENSORES** a la derecha, barra inferior con **Detalles** y **Ayuda** colapsables.
 
 | Control | Descripción |
 |---------|-------------|
 | Volumen | Slider 0–100 (también `a` / `z`); botón **Silenciar** |
 | Umbral de ruido | Solo se oye por encima de este nivel (`--audio-gate-db` por CLI); presets Llanto / Suave / Off |
+| Puerta | Indicador ABIERTA / CERRADA (pre-volumen: evalúa señal del stream) |
 | Nivel audio | Medidor con línea roja = umbral |
 | Movimiento (imagen) | Cambio entre frames |
 | Alarma cámara | Estado vía CGI; puede mostrar N/D según modelo |
@@ -127,6 +130,23 @@ Ejecutar el visor como módulo (sin usar el CLI):
 ```bash
 python -m foscam.viewer --ip 192.168.1.6 --user admin --password xxx [--sub] [--audio-gate-db -38] [--nvidia]
 ```
+
+Diagnóstico de puerta de ruido (stderr): `--audio-gate-debug` o `FOSCAM_AUDIO_GATE_DEBUG=1`.
+
+### Tests y probe de audio gate
+
+```bash
+pip install -e ".[dev]"
+pytest tests/ -m "not integration"
+pytest tests/ -m integration   # requiere ffmpeg en PATH
+
+# Sin cámara: simular tono/ruido y barrer umbrales
+foscam-audio-gate-probe --input-dbf -50 --gate-db -38 --volume 25 --backend pyav
+foscam-audio-gate-probe --scenario noise_peak --sweep-gate="-90,-48,-38,-20"
+foscam-audio-gate-probe --backend ffplay --gate-db -38   # cadena agate para ffplay
+```
+
+Diagnóstico en vivo: `foscam view ... --audio-gate-debug` (o `--no-nvidia` / `--nvidia`).
 
 ### Consola de comandos CGI
 

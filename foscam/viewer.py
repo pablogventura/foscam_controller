@@ -28,6 +28,18 @@ import requests
 from urllib.parse import urlencode, quote
 import xml.etree.ElementTree as ET
 
+from foscam.audio_gate import (
+    AUDIO_DB_CEIL,
+    AUDIO_DB_FLOOR,
+    GATE_PRESETS,
+    GATE_SLIDER_MAX,
+    GATE_SLIDER_MIN,
+    apply_gate,
+    ffplay_agate_filter,
+    gate_is_open,
+    process_playback_chunk,
+    samples_db,
+)
 from foscam.client import FoscamClient
 from foscam.ui.shell import ViewerShell
 from foscam.ui import theme as ui_theme
@@ -48,12 +60,8 @@ AUDIO_AVAILABLE = PYAV_AUDIO_AVAILABLE or (shutil.which("ffplay") is not None)
 
 MOTION_FRAME_SIZE = (160, 120)
 METER_EMA_ALPHA = 0.25
-AUDIO_DB_FLOOR = -60.0
-AUDIO_DB_CEIL = 0.0
-GATE_SLIDER_MIN = -90
-GATE_SLIDER_MAX = -20
-GATE_PRESETS = {"Llanto": -38.0, "Suave": -48.0, "Off": -90.0}
 VIEWER_PREFS_PATH = Path.home() / ".config" / "foscam-controller" / "viewer.json"
+GATE_DEBUG_EVERY_N = 50
 DISPLAY_INTERVAL_MS = 33  # ~30 FPS UI; menos carga que 20 ms con CTkImage
 DISPLAY_DETAIL_EVERY_N = 15  # actualizar panel técnico cada N frames mostrados
 
@@ -102,13 +110,49 @@ def _save_viewer_prefs(
         pass
 
 
+def _stream_channel_count(audio_stream) -> int:
+    """Número de canales para sounddevice (layout.channels es tupla, no int)."""
+    ch = getattr(audio_stream, "channels", None)
+    if isinstance(ch, int) and ch > 0:
+        return ch
+    layout = getattr(audio_stream, "layout", None)
+    if layout is not None:
+        nb = getattr(layout, "nb_channels", None)
+        if isinstance(nb, int) and nb > 0:
+            return nb
+        chs = getattr(layout, "channels", None)
+        if chs is not None:
+            try:
+                n = len(chs)
+                if n > 0:
+                    return n
+            except TypeError:
+                pass
+    return 1
+
+
+def probe_nvh264dec_available() -> bool:
+    """True si gst-inspect encuentra nvh264dec (GPU NVIDIA)."""
+    try:
+        r = subprocess.run(
+            ["gst-inspect-1.0", "nvh264dec"],
+            capture_output=True,
+            timeout=5,
+            env={**os.environ, "GST_INSPECT_NO_COLORS": "1"},
+        )
+        return r.returncode == 0
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        return False
+
+
 class FoscamViewer:
     """GUI application to view Foscam camera streams."""
     
     def __init__(
         self, root, ip, port, user, password,
         use_sub_stream=False, audio_gate_db=None, use_nvidia_decode=False,
-        initial_volume=None, ui_scale=None,
+        nvidia_source="off", initial_volume=None, ui_scale=None,
+        audio_gate_debug=False,
     ):
         prefs = _load_viewer_prefs()
         self.ui_scale = float(
@@ -147,6 +191,16 @@ class FoscamViewer:
             self.audio_gate_db = float(prefs.get("audio_gate_db", -38.0))
         # Decodificación por GPU NVIDIA (GStreamer nvh264dec) si está disponible
         self.use_nvidia_decode = use_nvidia_decode
+        self.nvidia_source = nvidia_source
+        self._audio_gate_debug = bool(
+            audio_gate_debug or os.environ.get("FOSCAM_AUDIO_GATE_DEBUG"),
+        )
+        self._gate_open_state = None
+        self._gate_debug_blocks = 0
+        self._gate_debug_pass = 0
+        self._last_ffplay_cmd = None
+        self._last_sidecar_error = None
+        self._audio_ffplay_fallback = False
         
         # Video stream
         self.cap = None
@@ -188,10 +242,14 @@ class FoscamViewer:
         self._audio_restart_in_progress = False
         self._gate_restart_after_id = None
         self._prefs_save_after_id = None
+        self._shutting_down = False
+        self._ui_active = True
+        self._close_started = False
         # Medidores (actualizados desde hilos de stream / CGI)
         self._audio_level = 0.0
         self._audio_level_ema = 0.0
-        self._audio_level_db = -60.0
+        self._audio_level_db = AUDIO_DB_FLOOR
+        self._audio_level_db_ema = float(AUDIO_DB_FLOOR)
         self._audio_meter_thread = None
         self._audio_meter_stop = threading.Event()
         self._motion_level = 0.0
@@ -305,7 +363,21 @@ class FoscamViewer:
         dec = self.decode_backend_var.get()
         if dec:
             parts.append(f"Decode: {dec}")
+        if self.use_nvidia_decode:
+            parts.append(f"NVIDIA: {self.nvidia_source}")
         parts.append(f"Audio: {self._audio_backend_label()}")
+        if self._last_ffplay_cmd:
+            parts.append(f"ffplay: {self._last_ffplay_cmd}")
+        if self._last_sidecar_error and not getattr(self, "_use_pyav_audio_sidecar", False):
+            parts.append(f"Sidecar error: {self._last_sidecar_error}")
+        if getattr(self, "_audio_ffplay_fallback", False):
+            parts.append("AVISO: audio por ffplay (umbral al reiniciar)")
+        if self._audio_gate_debug and self._gate_debug_blocks > 0:
+            pct = 100.0 * self._gate_debug_pass / max(1, self._gate_debug_blocks)
+            parts.append(
+                f"Gate debug: {self._gate_debug_pass}/{self._gate_debug_blocks} "
+                f"bloques abiertos ({pct:.0f}%)",
+            )
         self.ui.set_params_display("\n".join(parts))
 
     def _toggle_details_panel(self) -> None:
@@ -377,47 +449,53 @@ class FoscamViewer:
             pass
 
     def _samples_db(self, samples) -> float:
-        """Nivel RMS en dB de un bloque de muestras (misma escala que el medidor)."""
         if np is None:
             return AUDIO_DB_FLOOR
-        arr = np.asarray(samples, dtype=np.float64)
-        if arr.size == 0:
-            return AUDIO_DB_FLOOR
-        rms = float(np.sqrt(np.mean(np.square(arr))))
-        return max(AUDIO_DB_FLOOR, min(AUDIO_DB_CEIL, 20.0 * np.log10(rms + 1e-9)))
+        return samples_db(samples)
 
-    def _gate_is_open(self, samples=None) -> bool:
-        """True si el audio debe pasar según umbral (alineado con la línea del medidor)."""
-        db_thresh = float(self.audio_gate_db)
-        if db_thresh <= GATE_SLIDER_MIN + 1:
-            return True
+    def _gate_is_open(self, samples=None, *, for_playback: bool = False) -> bool:
+        chunk_db = self._samples_db(samples) if samples is not None else None
         level_db = float(getattr(self, "_audio_level_db", AUDIO_DB_FLOOR))
-        if samples is not None and np is not None:
-            chunk_db = self._samples_db(samples)
-            if max(chunk_db, level_db) >= db_thresh:
-                return True
-            return False
-        return level_db >= db_thresh
+        return gate_is_open(
+            self.audio_gate_db,
+            chunk_db=chunk_db,
+            level_db=level_db,
+            chunk_only=for_playback,
+        )
 
     def _apply_audio_gate(self, samples):
-        """Puerta en dB: usa EMA del medidor + pico del bloque actual."""
-        if self._gate_is_open(samples):
-            return samples
         if np is None:
             return samples
-        arr = np.asarray(samples, dtype=np.float32)
-        return np.zeros_like(arr)
+        return apply_gate(
+            samples,
+            self.audio_gate_db,
+            level_db=float(getattr(self, "_audio_level_db", AUDIO_DB_FLOOR)),
+            chunk_only=True,
+        )
 
     def _ffplay_audio_filter(self):
-        """Filtro FFmpeg para ffplay; None si el umbral está desactivado."""
-        db = float(self.audio_gate_db)
-        if db <= GATE_SLIDER_MIN + 1:
-            return None
-        th_lin = max(1e-6, min(1.0, 10 ** (db / 20.0)))
-        return (
-            f"agate=threshold={th_lin:.8f}:ratio=9000:range=1:"
-            f"attack=0.01:release=0.05"
+        return ffplay_agate_filter(self.audio_gate_db)
+
+    def _log_gate_debug(self, chunk_db: float, gate_open: bool) -> None:
+        if not self._audio_gate_debug:
+            return
+        self._gate_debug_blocks += 1
+        if gate_open:
+            self._gate_debug_pass += 1
+        if self._gate_debug_blocks % GATE_DEBUG_EVERY_N != 0:
+            return
+        pct = 100.0 * self._gate_debug_pass / max(1, self._gate_debug_blocks)
+        level_db = float(getattr(self, "_audio_level_db", AUDIO_DB_FLOOR))
+        print(
+            f"[gate] backend={self._audio_backend_label()} "
+            f"thresh={self.audio_gate_db:.0f} chunk={chunk_db:.1f} "
+            f"level={level_db:.1f} open={gate_open} pass_pct={pct:.0f}",
+            file=sys.stderr,
         )
+        try:
+            self.root.after(0, self._update_technical_details)
+        except (tk.TclError, AttributeError):
+            pass
 
     def _audio_backend_label(self) -> str:
         if getattr(self, "_use_pyav", False):
@@ -504,6 +582,12 @@ class FoscamViewer:
         self.ui.highlight_gate_preset(self.audio_gate_db)
         self._schedule_save_prefs()
         self._update_technical_details()
+        if self._audio_gate_debug and not self._uses_live_audio_gate():
+            print(
+                f"[gate] slider→{self.audio_gate_db:.0f} scheduling ffplay restart "
+                f"filter={self._ffplay_audio_filter()!r}",
+                file=sys.stderr,
+            )
         if self._uses_live_audio_gate():
             return
         self._schedule_ffplay_audio_restart()
@@ -517,44 +601,58 @@ class FoscamViewer:
 
     def _do_ffplay_audio_restart(self):
         self._gate_restart_after_id = None
-        if self._uses_live_audio_gate() or not self.is_streaming:
+        if (
+            self._uses_live_audio_gate()
+            or not self.is_streaming
+            or self._shutting_down
+        ):
             return
         if self._audio_restart_in_progress:
             return
         self._audio_restart_in_progress = True
 
         def do_restart():
-            self._audio_stop.set()
-            self._terminate_audio_process()
-            if self.audio_thread and self.audio_thread.is_alive():
-                self.audio_thread.join(timeout=2.5)
-            self._audio_stop.clear()
-            self._audio_restart_in_progress = False
-            if not self.is_streaming:
-                return
-            self.audio_thread = threading.Thread(target=self._audio_playback_thread, daemon=True)
-            self.audio_thread.start()
+            try:
+                self._audio_stop.set()
+                self._terminate_audio_process()
+                if self.audio_thread and self.audio_thread.is_alive():
+                    self.audio_thread.join(timeout=2.5)
+                if not self.is_streaming or self._shutting_down:
+                    return
+                self._audio_stop.clear()
+                self.audio_thread = threading.Thread(
+                    target=self._audio_playback_thread, daemon=True,
+                )
+                self.audio_thread.start()
+                if self._audio_gate_debug:
+                    print(
+                        f"[gate] ffplay reiniciado gate={self.audio_gate_db:.0f} "
+                        f"filter={self._ffplay_audio_filter()!r}",
+                        file=sys.stderr,
+                    )
+            finally:
+                self._audio_restart_in_progress = False
 
         threading.Thread(target=do_restart, daemon=True).start()
 
     def _update_audio_level_from_samples(self, arr):
+        """Actualiza medidor desde un bloque (misma ventana que los chunks del gate)."""
         if np is None or arr is None or arr.size == 0:
             return
-        rms = float(np.sqrt(np.mean(np.square(arr.astype(np.float64)))))
-        db = 20.0 * np.log10(rms + 1e-9)
-        db = max(AUDIO_DB_FLOOR, min(AUDIO_DB_CEIL, db))
-        span = AUDIO_DB_CEIL - AUDIO_DB_FLOOR
-        level = ((db - AUDIO_DB_FLOOR) / span) * 100.0 if span > 0 else 0.0
-        level = max(0.0, min(100.0, level))
-        self._audio_level_ema = (
-            METER_EMA_ALPHA * level + (1.0 - METER_EMA_ALPHA) * self._audio_level_ema
-        )
-        self._audio_level = self._audio_level_ema
+        db = self._samples_db(arr)
         self._audio_level_db = db
+        self._audio_level_db_ema = (
+            METER_EMA_ALPHA * db + (1.0 - METER_EMA_ALPHA) * self._audio_level_db_ema
+        )
+        from foscam.audio_gate import db_to_meter_ratio
+
+        self._audio_level = db_to_meter_ratio(self._audio_level_db_ema) * 100.0
 
     def _try_start_pyav_audio_sidecar(self, rtsp_url):
         """Audio PyAV + sounddevice con vídeo OpenCV (puerta y volumen en vivo)."""
+        self._last_sidecar_error = None
         if not PYAV_AUDIO_AVAILABLE:
+            self._last_sidecar_error = "PyAV/sounddevice no disponible"
             return False
         container = None
         try:
@@ -568,7 +666,7 @@ class FoscamViewer:
             self._av_audio_stream = audio_stream
             self._use_pyav_audio_sidecar = True
             sr = int(audio_stream.sample_rate)
-            ch = audio_stream.layout.channels if hasattr(audio_stream.layout, "channels") else 1
+            ch = _stream_channel_count(audio_stream)
             self._sd_channels = ch
             self._audio_queue = queue.Queue(maxsize=min(2048, max(32, sr // 10)))
             self._sd_stream = sd.OutputStream(
@@ -580,8 +678,10 @@ class FoscamViewer:
                 target=self._av_audio_sidecar_demux_thread, daemon=True,
             )
             self._av_audio_sidecar_thread.start()
+            self._audio_ffplay_fallback = False
             return True
-        except Exception:
+        except Exception as exc:
+            self._last_sidecar_error = str(exc)
             if container is not None:
                 try:
                     container.close()
@@ -590,26 +690,46 @@ class FoscamViewer:
             self._stop_pyav_audio_sidecar()
             return False
 
+    def _start_pyav_audio_sidecar_with_retry(self, rtsp_url, retries: int = 3) -> bool:
+        for attempt in range(retries + 1):
+            if attempt > 0:
+                time.sleep(0.4)
+            if self._try_start_pyav_audio_sidecar(rtsp_url):
+                return True
+            if self._audio_gate_debug:
+                print(
+                    f"[gate] sidecar intento {attempt + 1} falló: {self._last_sidecar_error}",
+                    file=sys.stderr,
+                )
+        return False
+
     def _stop_pyav_audio_sidecar(self):
         self._use_pyav_audio_sidecar = False
         self._audio_queue = None
-        if self._sd_stream is not None:
+        container = self._av_audio_container
+        if container is not None:
+            self._av_audio_container = None
             try:
-                self._sd_stream.stop()
-                self._sd_stream.close()
+                container.close()
             except Exception:
                 pass
+        if self._sd_stream is not None:
+            stream = self._sd_stream
             self._sd_stream = None
+            try:
+                if hasattr(stream, "abort"):
+                    stream.abort()
+            except Exception:
+                pass
+            try:
+                stream.stop()
+                stream.close()
+            except Exception:
+                pass
         t = getattr(self, "_av_audio_sidecar_thread", None)
         if t is not None and t.is_alive():
             t.join(timeout=2.0)
         self._av_audio_sidecar_thread = None
-        if self._av_audio_container is not None:
-            try:
-                self._av_audio_container.close()
-            except Exception:
-                pass
-            self._av_audio_container = None
         self._av_audio_stream = None
 
     def _av_audio_sidecar_demux_thread(self):
@@ -627,12 +747,12 @@ class FoscamViewer:
                         arr = frame.to_ndarray()
                         if arr.dtype != np.float32:
                             arr = arr.astype(np.float32) / 32768.0
-                        self._update_audio_level_from_samples(arr)
                         ch = arr.shape[1] if arr.ndim > 1 else 1
                         step = 1024 * ch
                         for i in range(0, arr.size, step):
                             chunk = arr.ravel()[i:i + step].copy()
                             if len(chunk) > 0:
+                                self._update_audio_level_from_samples(chunk)
                                 try:
                                     audio_queue.put_nowait(chunk)
                                 except queue.Full:
@@ -717,11 +837,17 @@ class FoscamViewer:
 
     def _meter_ui_loop(self):
         try:
-            self.vu_meter.redraw(self._audio_level)
+            self.vu_meter.redraw_db(self._audio_level_db_ema)
             gate_db = self.audio_gate_db
+            above = self._audio_level_db_ema >= gate_db if gate_db > GATE_SLIDER_MIN + 1 else True
+            hint = "≥ umbral" if above else "< umbral"
             self._audio_level_label_var.set(
-                f"{self._audio_level_db:.1f} dB (umbral {gate_db:.0f})"
+                f"{self._audio_level_db_ema:.1f} dB {hint} ({gate_db:.0f} dB)",
             )
+            if self._uses_live_audio_gate():
+                self.ui.set_gate_state(self._gate_open_state)
+            else:
+                self.ui.set_gate_state(self._gate_is_open(for_playback=False))
             self._motion_meter.set(self._motion_level / 100.0)
             if self._camera_alarm_active is None:
                 self._camera_alarm_meter.set(0)
@@ -736,8 +862,12 @@ class FoscamViewer:
                 self._camera_alarm_label_var.set("Inactiva")
                 self.ui.set_alarm_badge(False)
         except tk.TclError:
-            pass
-        self.root.after(100, self._meter_ui_loop)
+            return
+        if self._ui_active:
+            try:
+                self.root.after(100, self._meter_ui_loop)
+            except tk.TclError:
+                pass
 
     def _parse_cgi_motion_alarm(self, xml_text):
         if not xml_text:
@@ -874,7 +1004,10 @@ class FoscamViewer:
     def _connect_camera(self):
         """Connect to the camera and start streaming."""
         self._set_connection_state("connecting")
-        self._set_status_short(f"Conectando a {self.camera_ip}:{self.camera_port}…")
+        msg = f"Conectando a {self.camera_ip}:{self.camera_port}…"
+        if self.use_nvidia_decode:
+            msg += f" (NVIDIA {self.nvidia_source})"
+        self._set_status_short(msg)
         threading.Thread(target=self._start_stream, daemon=True).start()
     
     def _gst_uri_safe(self, rtsp_url):
@@ -1022,13 +1155,14 @@ class FoscamViewer:
                             ))
                             self.is_streaming = True
                             self._use_pyav = True
+                            self._audio_ffplay_fallback = False
                             self._decode_backend = "ffmpeg"
                             self.root.after(0, self._update_ui_connected)
                             self._fetch_and_set_camera_name()
                             self.root.after(0, lambda v=self._playback_volume: self.volume_var.set(f"Vol: {v}"))
                             if audio_stream is not None:
                                 sr = int(audio_stream.sample_rate)
-                                ch = audio_stream.layout.channels if hasattr(audio_stream.layout, "channels") else 1
+                                ch = _stream_channel_count(audio_stream)
                                 self._sd_channels = ch
                                 self._audio_queue = queue.Queue(maxsize=min(2048, max(32, sr // 10)))
                                 self._sd_stream = sd.OutputStream(
@@ -1089,8 +1223,14 @@ class FoscamViewer:
                         if AUDIO_AVAILABLE:
                             self.root.after(0, lambda v=self._playback_volume: self.volume_var.set(f"Vol: {v}"))
                             self._audio_stop.clear()
-                            live_audio = self._try_start_pyav_audio_sidecar(rtsp_url)
+                            live_audio = self._start_pyav_audio_sidecar_with_retry(rtsp_url)
+                            self._audio_ffplay_fallback = not live_audio
                             if not live_audio:
+                                if PYAV_AUDIO_AVAILABLE:
+                                    err = self._last_sidecar_error or "desconocido"
+                                    self.root.after(0, lambda e=err: self._set_status_short(
+                                        f"Audio: ffplay (sidecar falló: {e})",
+                                    ))
                                 self.audio_thread = threading.Thread(
                                     target=self._audio_playback_thread, daemon=True,
                                 )
@@ -1138,11 +1278,14 @@ class FoscamViewer:
         """Callback sounddevice: puerta y volumen en tiempo real (modo PyAV)."""
         if status:
             pass
+        if not self.is_streaming or self._shutting_down:
+            outdata.fill(0)
+            return
         q = getattr(self, "_audio_queue", None)
         if q is None:
             outdata.fill(0)
             return
-        vol = max(0, min(100, getattr(self, "_playback_volume", 50))) / 100.0
+        vol_pct = max(0, min(100, getattr(self, "_playback_volume", 50)))
         need = frames * (getattr(self, "_sd_channels", 1))
         out = outdata.ravel()
         filled = 0
@@ -1151,9 +1294,17 @@ class FoscamViewer:
                 chunk = q.get_nowait()
                 if chunk is None:
                     break
-                samples = self._apply_audio_gate(chunk)
+                if np is not None:
+                    processed, gate_open = process_playback_chunk(
+                        chunk, self.audio_gate_db, vol_pct,
+                    )
+                    self._gate_open_state = gate_open
+                    self._log_gate_debug(self._samples_db(chunk), gate_open)
+                    samples = processed
+                else:
+                    samples = self._apply_audio_gate(chunk) * (vol_pct / 100.0)
                 n = min(len(samples), need - filled)
-                out[filled:filled + n] = samples[:n] * vol
+                out[filled:filled + n] = samples[:n]
                 filled += n
             except queue.Empty:
                 break
@@ -1195,13 +1346,12 @@ class FoscamViewer:
                             arr = frame.to_ndarray()
                             if arr.dtype != np.float32:
                                 arr = arr.astype(np.float32) / 32768.0
-                            self._update_audio_level_from_samples(arr)
-                            # Enviar por trozos si es muy grande (evitar bloques enormes)
                             ch = arr.shape[1] if arr.ndim > 1 else 1
                             step = 1024 * ch
                             for i in range(0, arr.size, step):
                                 chunk = arr.ravel()[i:i + step].copy()
                                 if len(chunk) > 0:
+                                    self._update_audio_level_from_samples(chunk)
                                     try:
                                         audio_queue.put_nowait(chunk)
                                     except queue.Full:
@@ -1220,8 +1370,14 @@ class FoscamViewer:
             self._av_container = None
     
     def _audio_playback_thread(self):
-        """Play audio from RTSP using ffplay (no video window). -volume 0-100; opcional compand (puerta de ruido)."""
-        if not AUDIO_AVAILABLE or not self.rtsp_url:
+        """Reproduce audio RTSP con ffplay (-volume; puerta vía filtro agate)."""
+        if (
+            not AUDIO_AVAILABLE
+            or not self.rtsp_url
+            or self._audio_stop.is_set()
+            or not self.is_streaming
+            or self._shutting_down
+        ):
             return
         try:
             vol = max(0, min(100, getattr(self, "_playback_volume", 50)))
@@ -1229,6 +1385,10 @@ class FoscamViewer:
             af = self._ffplay_audio_filter()
             if af:
                 cmd = ["ffplay", "-nodisp", "-autoexit", "-volume", str(vol), "-af", af, "-i", self.rtsp_url]
+            self._last_ffplay_cmd = " ".join(cmd)
+            if self._audio_gate_debug:
+                print(f"[ffplay] start pid-pending cmd={self._last_ffplay_cmd}", file=sys.stderr)
+            self.root.after(0, self._update_technical_details)
             # start_new_session=True para poder matar el grupo al cerrar (evita que ffplay quede abierto)
             self._audio_process = subprocess.Popen(
                 cmd,
@@ -1238,7 +1398,15 @@ class FoscamViewer:
                 start_new_session=True,
             )
             proc = self._audio_process  # referencia local: otro hilo puede poner _audio_process = None
-            while proc is not None and proc.poll() is None and not self._audio_stop.is_set():
+            if self._audio_gate_debug and proc is not None:
+                print(f"[ffplay] pid={proc.pid}", file=sys.stderr)
+            while (
+                proc is not None
+                and proc.poll() is None
+                and not self._audio_stop.is_set()
+                and self.is_streaming
+                and not self._shutting_down
+            ):
                 time.sleep(0.2)
             if proc is not None and proc.poll() is None:
                 self._terminate_audio_process()
@@ -1342,10 +1510,14 @@ class FoscamViewer:
                     self._update_technical_details()
 
         except Exception as e:
-            if self.is_streaming:
+            if self.is_streaming and self._ui_active:
                 self._set_status_short(f"Display error: {str(e)}")
 
-        self.root.after(DISPLAY_INTERVAL_MS, self._update_display_loop)
+        if self._ui_active:
+            try:
+                self.root.after(DISPLAY_INTERVAL_MS, self._update_display_loop)
+            except tk.TclError:
+                pass
     
     def _update_ui_connected(self):
         """Update UI after successful connection."""
@@ -1371,75 +1543,132 @@ class FoscamViewer:
         self._set_connection_state("error")
         self._set_status_short(f"Error de conexión: {error_msg}")
         messagebox.showerror("Error de conexión", f"No se pudo conectar a la cámara:\n{error_msg}")
-        # Close window after showing error
-        self.root.after(2000, self.root.destroy)
-    
+        self.root.after(2000, self._close_after_connection_failed)
+
+    def _close_after_connection_failed(self):
+        self._shutting_down = True
+        self._ui_active = False
+        self._cancel_pending_after(all_callbacks=True)
+        self._disconnect_camera()
+        try:
+            self.root.destroy()
+        except tk.TclError:
+            pass
+
+    def _cancel_pending_after(self, all_callbacks: bool = False) -> None:
+        """Cancela reinicios de ffplay y, al cerrar, también guardados diferidos."""
+        for attr in ("_gate_restart_after_id",):
+            aid = getattr(self, attr, None)
+            if aid is not None:
+                setattr(self, attr, None)
+                try:
+                    self.root.after_cancel(aid)
+                except tk.TclError:
+                    pass
+        if not all_callbacks:
+            return
+        for attr in ("_prefs_save_after_id", "_geom_save_after_id"):
+            aid = getattr(self, attr, None)
+            if aid is not None:
+                setattr(self, attr, None)
+                try:
+                    self.root.after_cancel(aid)
+                except tk.TclError:
+                    pass
+
+    def _stop_sounddevice_stream(self) -> None:
+        stream = getattr(self, "_sd_stream", None)
+        if stream is None:
+            return
+        self._sd_stream = None
+        try:
+            if hasattr(stream, "abort"):
+                stream.abort()
+        except Exception:
+            pass
+        try:
+            stream.stop()
+            stream.close()
+        except Exception:
+            pass
+
     def _terminate_audio_process(self):
-        """Cierra el proceso de audio (ffplay); usa kill del grupo si hace falta."""
+        """Cierra el proceso de audio (ffplay); mata el grupo de procesos si hace falta."""
         if self._audio_process is None:
             return
         proc = self._audio_process
         self._audio_process = None
         if proc.poll() is not None:
             return
-        try:
-            proc.terminate()
-            proc.wait(timeout=1)
-        except (subprocess.TimeoutExpired, ProcessLookupError):
+        pid = proc.pid
+
+        def _wait_proc(timeout: float) -> None:
             try:
-                proc.kill()
-                proc.wait(timeout=1)
+                proc.wait(timeout=timeout)
             except (subprocess.TimeoutExpired, ProcessLookupError):
-                if hasattr(os, "killpg"):
-                    try:
-                        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-                    except (ProcessLookupError, OSError):
-                        pass
-            except Exception:
                 pass
+
+        try:
+            if hasattr(os, "killpg"):
+                try:
+                    os.killpg(os.getpgid(pid), signal.SIGTERM)
+                    _wait_proc(0.8)
+                    if proc.poll() is None:
+                        os.killpg(os.getpgid(pid), signal.SIGKILL)
+                        _wait_proc(0.5)
+                    return
+                except (ProcessLookupError, OSError):
+                    pass
+            proc.terminate()
+            _wait_proc(1.0)
+            if proc.poll() is None:
+                proc.kill()
+                _wait_proc(0.5)
+        except (ProcessLookupError, OSError):
+            pass
         except Exception:
             pass
 
     def _disconnect_camera(self):
         """Disconnect from the camera and stop streaming."""
         self.is_streaming = False
+        self._audio_ffplay_fallback = False
+        self._gate_open_state = None
+        self._audio_stop.set()
+        self._cancel_pending_after()
+        self._audio_restart_in_progress = False
         self._cgi_poll_stop.set()
         self._stop_audio_level_meter()
         self._prev_gray = None
         self._motion_level = 0.0
         self._motion_ema = 0.0
         self._audio_level = 0.0
+        self._audio_level_db = AUDIO_DB_FLOOR
+        self._audio_level_db_ema = float(AUDIO_DB_FLOOR)
         self._camera_alarm_active = None
         self.volume_var.set("Vol: --")
         if getattr(self, "_use_pyav", False):
             self._use_pyav = False
             self._audio_queue = None
-            if self._sd_stream is not None:
+            container = self._av_container
+            if container is not None:
+                self._av_container = None
                 try:
-                    self._sd_stream.stop()
-                    self._sd_stream.close()
+                    container.close()
                 except Exception:
                     pass
-                self._sd_stream = None
+            self._stop_sounddevice_stream()
             if self._av_demux_thread is not None and self._av_demux_thread.is_alive():
                 self._av_demux_thread.join(timeout=2.0)
             self._av_demux_thread = None
-            if self._av_container is not None:
-                try:
-                    self._av_container.close()
-                except Exception:
-                    pass
-                self._av_container = None
         else:
             if getattr(self, "_use_pyav_audio_sidecar", False):
                 self._stop_pyav_audio_sidecar()
-            else:
-                self._audio_stop.set()
-                self._terminate_audio_process()
-                if self.audio_thread and self.audio_thread.is_alive():
-                    time.sleep(0.3)
+            self._terminate_audio_process()
+            if self.audio_thread and self.audio_thread.is_alive():
+                self.audio_thread.join(timeout=3.0)
             if self.video_thread and self.video_thread.is_alive():
-                time.sleep(0.5)
+                self.video_thread.join(timeout=2.0)
             if self.cap is not None:
                 self.cap.release()
                 self.cap = None
@@ -1484,10 +1713,22 @@ class FoscamViewer:
     
     def _on_closing(self):
         """Handle window closing event."""
-        self._save_window_geometry()
-        self._do_save_prefs()
+        if self._close_started:
+            return
+        self._close_started = True
+        self._shutting_down = True
+        self._ui_active = False
+        self._cancel_pending_after(all_callbacks=True)
+        try:
+            self._save_window_geometry()
+            self._do_save_prefs()
+        except tk.TclError:
+            pass
         self._disconnect_camera()
-        self.root.destroy()
+        try:
+            self.root.destroy()
+        except tk.TclError:
+            pass
 
 
 def main():
@@ -1552,10 +1793,22 @@ Sin ellos se usa ffplay en subproceso (sin sync perfecto).
         ),
     )
     
-    parser.add_argument(
+    nvidia_group = parser.add_mutually_exclusive_group()
+    nvidia_group.add_argument(
         '--nvidia',
         action='store_true',
-        help='Decodificar video con GPU NVIDIA (GStreamer nvh264dec). Requiere OpenCV con GStreamer y plugins nvcodec. Si falla, se usa FFmpeg (CPU).'
+        help='Forzar decodificación GPU NVIDIA (GStreamer nvh264dec).',
+    )
+    nvidia_group.add_argument(
+        '--no-nvidia',
+        action='store_true',
+        help='Forzar vídeo por CPU (sin GPU).',
+    )
+
+    parser.add_argument(
+        '--audio-gate-debug',
+        action='store_true',
+        help='Log de diagnóstico de puerta de ruido en stderr (o FOSCAM_AUDIO_GATE_DEBUG=1).',
     )
 
     parser.add_argument(
@@ -1580,14 +1833,28 @@ Sin ellos se usa ffplay en subproceso (sin sync perfecto).
     ui_scale = getattr(args, "ui_scale", None)
     if ui_scale is None:
         ui_scale = prefs.get("ui_scale", ui_theme.DEFAULT_UI_SCALE)
+    if args.nvidia:
+        use_nvidia = True
+        nvidia_source = "manual"
+    elif getattr(args, "no_nvidia", False):
+        use_nvidia = False
+        nvidia_source = "off"
+    elif probe_nvh264dec_available():
+        use_nvidia = True
+        nvidia_source = "auto"
+    else:
+        use_nvidia = False
+        nvidia_source = "off"
     ui_theme.apply_theme(float(ui_scale))
     root = ctk.CTk()
     app = FoscamViewer(
         root, args.ip.strip(), args.port, args.user, args.password,
         use_sub_stream=args.sub,
         audio_gate_db=args.audio_gate_db,
-        use_nvidia_decode=args.nvidia,
+        use_nvidia_decode=use_nvidia,
+        nvidia_source=nvidia_source,
         ui_scale=ui_scale,
+        audio_gate_debug=getattr(args, "audio_gate_debug", False),
     )
     root.mainloop()
 

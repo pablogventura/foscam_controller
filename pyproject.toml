@@ -38,11 +38,20 @@ dependencies = [
   "customtkinter>=5.2.0",
 ]
 
+[project.optional-dependencies]
+dev = ["pytest>=7.0"]
+
+[tool.pytest.ini_options]
+markers = [
+    "integration: tests que requieren ffplay u otro binario del sistema",
+]
+
 [tool.setuptools.package-data]
 "foscam.ui.assets" = ["*.json"]
 
 [project.scripts]
 foscam = "foscam.cli:main"
+foscam-audio-gate-probe = "foscam.audio_gate_probe:main"
 
 [tool.setuptools.packages.find]
 where = ["."]

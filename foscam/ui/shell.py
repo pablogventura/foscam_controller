@@ -18,6 +18,12 @@ HELP_TEXT = """Atajos de teclado
 
 Cruceta en el vídeo: mantener pulsado para mover la cámara.
 
+Umbral de ruido: solo pasa audio por encima del umbral (pre-volumen).
+Indicador Puerta: ABIERTA / CERRADA según el bloque actual del stream.
+
+NVIDIA: si hay GPU, se usa automáticamente (--no-nvidia fuerza CPU).
+Diagnóstico gate: --audio-gate-debug o FOSCAM_AUDIO_GATE_DEBUG=1.
+
 Escala UI: --ui-scale 2.0 (o clave ui_scale en viewer.json)."""
 
 
@@ -245,6 +251,17 @@ class ViewerShell:
             self._preset_buttons[float(db)] = btn
         self.highlight_gate_preset(gate_db)
 
+        gate_row = ctk.CTkFrame(audio.body, fg_color="transparent")
+        gate_row.pack(fill=tk.X, pady=(0, 6))
+        ctk.CTkLabel(gate_row, text="Puerta", font=th.muted_font()).pack(side=tk.LEFT)
+        self._gate_state_var = tk.StringVar(value="N/D")
+        self.gate_state_badge = ctk.CTkLabel(
+            gate_row, textvariable=self._gate_state_var,
+            font=th.small_font(), text_color=th.TEXT_MUTED,
+            fg_color=th.BG_APP, corner_radius=6,
+        )
+        self.gate_state_badge.pack(side=tk.RIGHT)
+
         ctk.CTkLabel(audio.body, text="Nivel audio", font=th.muted_font()).pack(anchor=tk.W)
         mw, mh = th.audio_meter_size()
         self.vu_meter = VuMeter(audio.body, width=mw, height=mh)
@@ -328,6 +345,17 @@ class ViewerShell:
             self._ptz_hint.place(relx=0.98, rely=0.98, anchor=tk.SE)
         else:
             self._ptz_hint.place_forget()
+
+    def set_gate_state(self, open_: Optional[bool]) -> None:
+        if open_ is None:
+            self._gate_state_var.set("N/D")
+            self.gate_state_badge.configure(text_color=th.TEXT_MUTED, fg_color=th.BG_APP)
+        elif open_:
+            self._gate_state_var.set("ABIERTA")
+            self.gate_state_badge.configure(text_color=th.BG_APP, fg_color=th.WARNING)
+        else:
+            self._gate_state_var.set("CERRADA")
+            self.gate_state_badge.configure(text_color=th.BG_APP, fg_color=th.SUCCESS)
 
     def set_alarm_badge(self, state: Optional[bool]) -> None:
         if state is None:

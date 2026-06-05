@@ -55,6 +55,10 @@ def cmd_view(args) -> None:
         sys.argv.append("--sub")
     if getattr(args, "nvidia", False):
         sys.argv.append("--nvidia")
+    if getattr(args, "no_nvidia", False):
+        sys.argv.append("--no-nvidia")
+    if getattr(args, "audio_gate_debug", False):
+        sys.argv.append("--audio-gate-debug")
     if getattr(args, "audio_gate_db", None) is not None:
         sys.argv.extend(["--audio-gate-db", str(args.audio_gate_db)])
     if getattr(args, "ui_scale", None) is not None:
@@ -122,7 +126,14 @@ Ejemplos:
     p_view.add_argument("--password", required=True, help="Contraseña")
     p_view.add_argument("--port", type=int, default=88, help="Puerto (default: 88)")
     p_view.add_argument("--sub", action="store_true", help="Usar sub stream (menor resolución)")
-    p_view.add_argument("--nvidia", action="store_true", help="Decodificación GPU NVIDIA")
+    nvidia_grp = p_view.add_mutually_exclusive_group()
+    nvidia_grp.add_argument("--nvidia", action="store_true", help="Forzar decodificación GPU NVIDIA")
+    nvidia_grp.add_argument("--no-nvidia", action="store_true", help="Forzar vídeo CPU (sin GPU)")
+    p_view.add_argument(
+        "--audio-gate-debug",
+        action="store_true",
+        help="Log diagnóstico puerta de ruido en stderr",
+    )
     p_view.add_argument(
         "--audio-gate-db",
         type=float,

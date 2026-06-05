@@ -4,10 +4,8 @@ import tkinter as tk
 
 import customtkinter as ctk
 
+from foscam.audio_gate import METER_DB_MAX, METER_DB_MIN, db_to_meter_ratio
 from foscam.ui import theme as th
-
-AUDIO_DB_FLOOR = -60.0
-AUDIO_DB_CEIL = 0.0
 
 
 class StatusPill(ctk.CTkFrame):
@@ -66,28 +64,33 @@ class VuMeter(ctk.CTkFrame):
 
     def set_gate_db(self, db: float) -> None:
         self._gate_db = db
-        self.redraw(0.0)
 
     def set_enabled(self, enabled: bool) -> None:
         self._enabled = enabled
-        if not enabled:
-            self.redraw(0.0)
 
-    def _gate_x(self) -> int:
-        db = max(AUDIO_DB_FLOOR, min(AUDIO_DB_CEIL, self._gate_db))
-        span = AUDIO_DB_CEIL - AUDIO_DB_FLOOR
-        if span <= 0:
-            return 2
-        ratio = (db - AUDIO_DB_FLOOR) / span
+    def _db_to_x(self, db: float) -> int:
+        ratio = db_to_meter_ratio(db, METER_DB_MIN, METER_DB_MAX)
         return int(ratio * (self._meter_w - 4)) + 2
 
-    def redraw(self, level_pct: float) -> None:
+    def redraw_db(self, level_db: float) -> None:
+        """Barra y umbral en la misma escala dBFS (-60…0)."""
         c = self.canvas
         c.delete("all")
-        if self._enabled and level_pct > 0:
-            fill_w = max(1, int((level_pct / 100.0) * (self._meter_w - 2)))
-            c.create_rectangle(1, 1, 1 + fill_w, self._meter_h - 1, fill=th.VU_FILL, outline="")
-        c.create_line(self._gate_x(), 1, self._gate_x(), self._meter_h - 1, fill=th.DANGER, width=2)
+        if self._enabled:
+            fill_w = max(0, self._db_to_x(level_db) - 1)
+            if fill_w > 0:
+                c.create_rectangle(
+                    1, 1, 1 + fill_w, self._meter_h - 1,
+                    fill=th.VU_FILL, outline="",
+                )
+        gx = self._db_to_x(self._gate_db)
+        c.create_line(gx, 1, gx, self._meter_h - 1, fill=th.DANGER, width=2)
+
+    def redraw(self, level_pct: float) -> None:
+        """Compat: convierte porcentaje legacy a dB y delega."""
+        ratio = max(0.0, min(1.0, float(level_pct) / 100.0))
+        level_db = METER_DB_MIN + ratio * (METER_DB_MAX - METER_DB_MIN)
+        self.redraw_db(level_db)
 
 
 class ReconnectBanner(ctk.CTkFrame):
