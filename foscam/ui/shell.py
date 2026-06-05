@@ -10,7 +10,6 @@ from foscam.ui import theme as th
 from foscam.ui.overlay import OverlayWindow
 from foscam.ui.widgets import (
     IndicatorStrip,
-    PtzPad,
     ReconnectBanner,
     SectionCard,
     StatusPill,
@@ -28,8 +27,6 @@ HELP_TEXT = """Atajos de teclado
 • [ / ]: colapsar / expandir panel lateral
 • F11: pantalla completa (mantiene HUD)
 • Esc: salir de pantalla completa
-
-Cruceta en el vídeo: mantener pulsado para mover la cámara.
 
 Movimiento: rojo = cambio en imagen; azul = zonas MD de la cámara.
 Zoom auto: acerca al detectar movimiento y vuelve a vista normal al parar.
@@ -78,8 +75,6 @@ class ViewerShell:
         on_gate_change,
         on_gate_preset,
         on_display_resize,
-        on_ptz_move,
-        on_ptz_stop,
         on_toggle_details,
         on_toggle_help,
         on_toggle_hud=None,
@@ -107,17 +102,6 @@ class ViewerShell:
         self.reconnect_banner = ReconnectBanner(self.reconnect_overlay.body)
         self.reconnect_banner.pack(padx=8, pady=8)
         self.reconnect_overlay.hide()
-
-        self.ptz_overlay = self._make_overlay(framed=False)
-        self.ptz_pad = PtzPad(self.ptz_overlay.body, on_move=on_ptz_move, on_stop=on_ptz_stop)
-        self.ptz_pad.pack(padx=4, pady=4)
-
-        self.ptz_hint_overlay = self._make_overlay(framed=False)
-        self._ptz_hint = ctk.CTkLabel(
-            self.ptz_hint_overlay.body, text="Flechas / cruceta = PTZ",
-            font=ctk.CTkFont(size=10), text_color=th.TEXT_MUTED,
-        )
-        self._ptz_hint.pack(padx=10, pady=6)
 
         self.indicator_overlay = self._make_overlay(framed=True)
         self.indicator_strip = IndicatorStrip(
@@ -258,16 +242,12 @@ class ViewerShell:
             self._show_chrome()
             self._sync_sidebar_geometry(rx, ry, rw, rh, th_h, ft_h)
             self.indicator_overlay.hide()
-            self._sync_ptz_geometry(rx, ry, rw, rh, ft_h, cw)
-            self._sync_ptz_hint_geometry(rx, ry, rw, rh, ft_h, cw)
             self._sync_floating_panels_geometry(rx, ry, rw, rh, ft_h, cw)
         else:
             self._hide_chrome()
             self.sidebar.hide()
             self.details_overlay.hide()
             self.help_overlay.hide()
-            self.ptz_overlay.hide()
-            self.ptz_hint_overlay.hide()
             self._sync_indicator_geometry(rx, ry, rw, rh)
 
         self._update_hud_button()
@@ -302,37 +282,6 @@ class ViewerShell:
         # Evitar solaparse con zona inferior izquierda reservada al vídeo limpio
         self.indicator_overlay.set_geometry(x, y, w, h)
         self.indicator_overlay.show()
-
-    def _sync_ptz_geometry(
-        self, rx: int, ry: int, rw: int, rh: int, footer_h: int, content_w: int,
-    ) -> None:
-        self.ptz_pad.update_idletasks()
-        pw = self.ptz_pad.winfo_reqwidth() + 8
-        ph = self.ptz_pad.winfo_reqheight() + 8
-        x = rx + self._margin
-        y = ry + rh - footer_h - self._margin - ph
-        if y < ry + self._margin:
-            y = ry + self._margin
-        self.ptz_overlay.set_geometry(x, y, min(pw, content_w), ph)
-        self.ptz_overlay.show()
-
-    def _sync_ptz_hint_geometry(
-        self, rx: int, ry: int, rw: int, rh: int, footer_h: int, content_w: int,
-    ) -> None:
-        self._ptz_hint.update_idletasks()
-        w = min(content_w, self._ptz_hint.winfo_reqwidth() + 12)
-        h = self._ptz_hint.winfo_reqheight() + 8
-        x = rx + self._margin + max(0, content_w - w)
-        y = ry + rh - footer_h - self._margin - h
-        ptz_h = self.ptz_pad.winfo_reqheight() + 8
-        ptz_y = ry + rh - footer_h - self._margin - ptz_h
-        if abs(y - ptz_y) < h + 4:
-            y = ptz_y - h - 4
-        if y < ry + self._margin:
-            self.ptz_hint_overlay.hide()
-            return
-        self.ptz_hint_overlay.set_geometry(x, y, w, h)
-        self.ptz_hint_overlay.show()
 
     def _sync_floating_panels_geometry(
         self, rx: int, ry: int, rw: int, rh: int, footer_h: int, content_w: int,
@@ -381,52 +330,56 @@ class ViewerShell:
         titles.pack(side=tk.LEFT)
         self.title_var = tk.StringVar(value=self._camera_title)
         self.host_var = tk.StringVar(value=self.host)
-        ctk.CTkLabel(titles, textvariable=self.title_var, font=th.title_font()).pack(anchor=tk.W)
         ctk.CTkLabel(
-            titles, textvariable=self.host_var, font=th.muted_font(), text_color=th.TEXT_MUTED,
+            titles, textvariable=self.title_var, font=th.title_font(),
+            text_color=th.TEXT_GHOST,
+        ).pack(anchor=tk.W)
+        ctk.CTkLabel(
+            titles, textvariable=self.host_var, font=th.muted_font(),
+            text_color=th.TEXT_GHOST_MUTED,
+        ).pack(anchor=tk.W)
+        self.fps_var = tk.StringVar(value="")
+        ctk.CTkLabel(
+            titles, textvariable=self.fps_var, font=th.muted_font(),
+            text_color=th.TEXT_GHOST_MUTED,
         ).pack(anchor=tk.W)
 
         self.toolbar_right = self._register_chrome(
-            ctk.CTkFrame(host, fg_color="transparent", corner_radius=0),
+            ctk.CTkFrame(host, **th.chrome_panel_kwargs(corner_radius=10)),
         )
         right = self.toolbar_right
 
         self.hud_btn = ctk.CTkButton(
             right, text="H", width=36, height=32,
-            fg_color="transparent", border_width=1, border_color=th.TEXT_MUTED,
-            text_color=th.TEXT, hover_color=th.OVERLAY_HOVER,
+            **th.chrome_button_kwargs(),
             command=on_toggle_hud or self.toggle_hud,
         )
         self.hud_btn.pack(side=tk.RIGHT, padx=4)
 
         self.help_btn = ctk.CTkButton(
             right, text="?", width=36, height=32,
-            fg_color="transparent", border_width=1, border_color=th.TEXT_MUTED,
-            text_color=th.TEXT, hover_color=th.OVERLAY_HOVER,
+            **th.chrome_button_kwargs(),
             command=on_help,
         )
         self.help_btn.pack(side=tk.RIGHT, padx=4)
 
         self.mute_btn = ctk.CTkButton(
             right, text="Silenciar", width=90, height=32,
-            fg_color="transparent", border_width=1, border_color=th.TEXT_MUTED,
-            text_color=th.TEXT, hover_color=th.OVERLAY_HOVER,
+            **th.chrome_button_kwargs(),
             command=on_mute,
         )
         self.mute_btn.pack(side=tk.RIGHT, padx=4)
 
         self.disconnect_btn = ctk.CTkButton(
             right, text="Salir", width=80, height=32,
-            fg_color="transparent", border_width=1, border_color=th.TEXT_MUTED,
-            text_color=th.TEXT_MUTED, hover_color=th.DANGER,
+            **th.chrome_button_kwargs(danger=True),
             command=on_disconnect,
         )
         self.disconnect_btn.pack(side=tk.RIGHT, padx=4)
 
         self.snapshot_btn = ctk.CTkButton(
             right, text="Captura", width=90, height=32,
-            fg_color="transparent", border_width=1, border_color=th.ACCENT,
-            hover_color=th.OVERLAY_HOVER, text_color=th.ACCENT,
+            **th.chrome_button_kwargs(accent=True),
             command=on_snapshot,
         )
         self.snapshot_btn.pack(side=tk.RIGHT, padx=4)
@@ -434,7 +387,7 @@ class ViewerShell:
     def _build_footer(self, on_toggle_details, on_toggle_help):
         host = self.video_label
         self.footer_left = self._register_chrome(
-            ctk.CTkFrame(host, fg_color="transparent", corner_radius=0),
+            ctk.CTkFrame(host, **th.chrome_panel_kwargs(corner_radius=8)),
         )
         self.status_var = tk.StringVar(value=f"Conectando a {self.host}…")
         ctk.CTkLabel(
@@ -443,22 +396,20 @@ class ViewerShell:
         ).pack(side=tk.LEFT, padx=(4, 8), pady=2)
 
         self.footer_right = self._register_chrome(
-            ctk.CTkFrame(host, fg_color="transparent", corner_radius=0),
+            ctk.CTkFrame(host, **th.chrome_panel_kwargs(corner_radius=8)),
         )
         panel = self.footer_right
 
         self.btn_help_toggle = ctk.CTkButton(
             panel, text="Ayuda ▾", width=80, height=28,
-            fg_color="transparent", border_width=1, border_color=th.TEXT_MUTED,
-            text_color=th.TEXT_MUTED, hover_color=th.OVERLAY_HOVER,
+            **th.chrome_button_kwargs(),
             command=on_toggle_help,
         )
         self.btn_help_toggle.pack(side=tk.RIGHT, padx=(2, 4), pady=2)
 
         self.btn_details_toggle = ctk.CTkButton(
             panel, text="Detalles ▾", width=90, height=26,
-            fg_color="transparent", border_width=1, border_color=th.TEXT_MUTED,
-            text_color=th.TEXT_MUTED, hover_color=th.OVERLAY_HOVER,
+            **th.chrome_button_kwargs(accent=True),
             command=on_toggle_details,
         )
         self.btn_details_toggle.pack(side=tk.RIGHT, padx=4, pady=4)
@@ -476,8 +427,7 @@ class ViewerShell:
         )
         self.sidebar_toggle_btn = ctk.CTkButton(
             header, text="«", width=28, height=24,
-            fg_color="transparent", border_width=1, border_color=th.TEXT_MUTED,
-            text_color=th.TEXT_MUTED, hover_color=th.OVERLAY_HOVER,
+            **th.chrome_button_kwargs(),
             command=on_toggle_sidebar or self.toggle_sidebar_collapsed,
         )
         self.sidebar_toggle_btn.pack(side=tk.RIGHT)
@@ -488,8 +438,7 @@ class ViewerShell:
         self._sidebar_collapsed_view = ctk.CTkFrame(panel, fg_color="transparent")
         ctk.CTkButton(
             self._sidebar_collapsed_view, text="»", width=28, height=28,
-            fg_color="transparent", border_width=1, border_color=th.TEXT_MUTED,
-            text_color=th.TEXT_MUTED, hover_color=th.OVERLAY_HOVER,
+            **th.chrome_button_kwargs(),
             command=on_toggle_sidebar or self.toggle_sidebar_collapsed,
         ).pack(pady=(8, 4))
         cw = max(32, th.sidebar_collapsed_width() - 20)
@@ -569,8 +518,7 @@ class ViewerShell:
         for label, db in (("Llanto", -38), ("Suave", -48), ("Off", -90)):
             btn = ctk.CTkButton(
                 presets, text=label, width=72, height=26,
-                fg_color="transparent", border_width=1, border_color=th.TEXT_MUTED,
-                hover_color=th.OVERLAY_HOVER, text_color=th.TEXT,
+                **th.chrome_button_kwargs(),
                 font=th.small_font(),
                 command=lambda d=db: on_preset(d),
             )
@@ -688,8 +636,7 @@ class ViewerShell:
         for label, key in (("Sensible", "sensitive"), ("Normal", "normal"), ("Estricto", "strict")):
             ctk.CTkButton(
                 presets, text=label, width=72, height=26,
-                fg_color="transparent", border_width=1, border_color=th.TEXT_MUTED,
-                hover_color=th.OVERLAY_HOVER, text_color=th.TEXT, font=th.small_font(),
+                **th.chrome_button_kwargs(), font=th.small_font(),
                 command=lambda k=key: on_change("preset", k),
             ).pack(side=tk.LEFT, padx=(0, 6))
 
@@ -697,14 +644,12 @@ class ViewerShell:
         btn_row.pack(fill=tk.X, pady=(0, 4))
         ctk.CTkButton(
             btn_row, text="Actualizar zonas", width=110, height=26,
-            fg_color="transparent", border_width=1, border_color=th.TEXT_MUTED,
-            hover_color=th.OVERLAY_HOVER, font=th.small_font(),
+            **th.chrome_button_kwargs(), font=th.small_font(),
             command=lambda: on_change("refresh_zones", True),
         ).pack(side=tk.LEFT, padx=(0, 6))
         ctk.CTkButton(
             btn_row, text="Probar PTZ", width=90, height=26,
-            fg_color="transparent", border_width=1, border_color=th.TEXT_MUTED,
-            hover_color=th.OVERLAY_HOVER, font=th.small_font(),
+            **th.chrome_button_kwargs(), font=th.small_font(),
             command=lambda: on_change("test_ptz", True),
         ).pack(side=tk.LEFT)
 
@@ -716,8 +661,7 @@ class ViewerShell:
         self._motion_advanced_open = False
         self._motion_adv_btn = ctk.CTkButton(
             body, text="Avanzado ▾", width=100, height=24,
-            fg_color="transparent", border_width=1, border_color=th.TEXT_MUTED,
-            hover_color=th.OVERLAY_HOVER, font=th.small_font(),
+            **th.chrome_button_kwargs(), font=th.small_font(),
             command=self._toggle_motion_advanced,
         )
         self._motion_adv_btn.pack(anchor=tk.W, pady=(0, 4))
@@ -765,7 +709,7 @@ class ViewerShell:
         ).pack(side=tk.RIGHT, padx=(4, 0))
         ctk.CTkButton(
             prof_row, text="Borrar", width=56, height=24, font=th.small_font(),
-            fg_color="transparent", border_width=1, border_color=th.TEXT_MUTED,
+            **th.chrome_button_kwargs(danger=True),
             command=lambda: on_change("delete_profile", self._motion_profile_menu.get()),
         ).pack(side=tk.RIGHT, padx=(4, 0))
 
@@ -1020,6 +964,12 @@ class ViewerShell:
         self._camera_title = name
         self.title_var.set(name)
 
+    def set_display_fps(self, fps: Optional[float]) -> None:
+        if fps is None or fps <= 0:
+            self.fps_var.set("")
+        else:
+            self.fps_var.set(f"{fps:.1f} fps")
+
     def set_params_display(self, text: str) -> None:
         self._params_label.configure(text=text)
 
@@ -1043,13 +993,6 @@ class ViewerShell:
                 text="Silenciar", fg_color="transparent",
                 border_color=th.TEXT_MUTED, border_width=1, text_color=th.TEXT,
             )
-
-    def set_ptz_hint_visible(self, visible: bool) -> None:
-        if visible and self._hud_mode == "full":
-            self.ptz_hint_overlay.show()
-        else:
-            self.ptz_hint_overlay.hide()
-        self.sync_overlays()
 
     def _apply_gate_badge(self, badge, var, open_: Optional[bool]) -> None:
         if open_ is None:
@@ -1107,6 +1050,6 @@ class ViewerShell:
             *self._chrome_parts,
             self.sidebar,
             self.details_overlay, self.help_overlay,
-            self.indicator_overlay, self.ptz_overlay, self.ptz_hint_overlay,
+            self.indicator_overlay,
             self.reconnect_overlay,
         ]

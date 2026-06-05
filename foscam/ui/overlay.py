@@ -9,8 +9,8 @@ import customtkinter as ctk
 
 from foscam.ui import theme as th
 
-OVERLAY_IDLE_ALPHA = 0.32
-OVERLAY_HOVER_ALPHA = 0.90
+OVERLAY_IDLE_ALPHA = 0.62
+OVERLAY_HOVER_ALPHA = 0.94
 _HOVER_LEAVE_MS = 60
 
 

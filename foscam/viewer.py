@@ -6,6 +6,8 @@ Takes connection parameters from command line arguments.
 """
 
 import tkinter as tk
+from dataclasses import dataclass
+from typing import Optional
 from tkinter import messagebox
 
 import customtkinter as ctk
@@ -52,6 +54,13 @@ from foscam.motion import (
     parse_osd_mask_areas,
     save_motion_to_prefs,
 )
+from foscam.display_pacing import (
+    READER_QUEUE_FULL_SLEEP_SEC,
+    motion_analysis_needed,
+    next_display_delay_ms,
+    should_run_motion_analysis,
+    visual_overlays_needed,
+)
 from foscam.ui.shell import ViewerShell
 from foscam.ui import theme as ui_theme
 
@@ -73,8 +82,16 @@ MOTION_FRAME_SIZE = (160, 120)
 METER_EMA_ALPHA = 0.25
 VIEWER_PREFS_PATH = Path.home() / ".config" / "foscam-controller" / "viewer.json"
 GATE_DEBUG_EVERY_N = 50
-DISPLAY_INTERVAL_MS = 33  # ~30 FPS UI; menos carga que 20 ms con CTkImage
 DISPLAY_DETAIL_EVERY_N = 15  # actualizar panel técnico cada N frames mostrados
+
+
+@dataclass
+class _PreparedDisplay:
+    rgb: object
+    stream_w: int
+    stream_h: int
+    display_label_w: int
+    display_label_h: int
 
 
 def _load_viewer_prefs():
@@ -229,6 +246,18 @@ class FoscamViewer:
         self.is_streaming = False
         self.rtsp_url = None  # Set when video connects, used for audio
         self.frame_queue = queue.Queue(maxsize=2)  # Small queue to keep frames fresh
+        self.display_queue = queue.Queue(maxsize=1)
+        self._last_paint_monotonic = 0.0
+        self._display_fps = 0.0
+        self._display_fps_window_start = time.monotonic()
+        self._display_fps_window_count = 0
+        self._last_motion_analysis_monotonic = 0.0
+        self._motion_display_frame_index = 0
+        self._display_prep_stop = threading.Event()
+        self._display_prep_thread = threading.Thread(
+            target=self._display_prep_loop, daemon=True,
+        )
+        self._display_prep_thread.start()
         self.video_thread = None
         self.audio_thread = None
         self.current_frame = None
@@ -337,8 +366,6 @@ class FoscamViewer:
             on_gate_change=self._on_gate_slider,
             on_gate_preset=self._apply_gate_preset,
             on_display_resize=self._on_display_resize,
-            on_ptz_move=self._ptz_move,
-            on_ptz_stop=self._ptz_stop,
             on_toggle_details=self._toggle_details_panel,
             on_toggle_help=self._toggle_help_panel,
             on_toggle_hud=self._toggle_hud,
@@ -420,6 +447,8 @@ class FoscamViewer:
                 f"Gate debug: {self._gate_debug_pass}/{self._gate_debug_blocks} "
                 f"bloques abiertos ({pct:.0f}%)",
             )
+        if self.is_streaming and self._display_fps > 0:
+            parts.append(f"Display FPS: {self._display_fps:.1f}")
         self.ui.set_params_display("\n".join(parts))
 
     def _toggle_details_panel(self) -> None:
@@ -1108,6 +1137,198 @@ class FoscamViewer:
             self._heatmap.update(frame.shape, boxes)
         return level
 
+    def _motion_analysis_needed(self) -> bool:
+        s = self.motion_settings
+        return motion_analysis_needed(
+            show_live_overlay=s.show_live_overlay,
+            show_configured_zones=s.show_configured_zones,
+            auto_zoom_enabled=s.auto_zoom.enabled,
+            heatmap_enabled=s.heatmap.enabled,
+            snapshot_enabled=s.snapshot_on_motion.enabled,
+            debug_fsm_overlay=s.debug_fsm_overlay,
+        )
+
+    def _maybe_update_motion(self, frame) -> None:
+        self._motion_display_frame_index += 1
+        now = time.monotonic()
+        if not should_run_motion_analysis(
+            needed=self._motion_analysis_needed(),
+            frame_index=self._motion_display_frame_index,
+            last_analysis_monotonic=self._last_motion_analysis_monotonic,
+            now_monotonic=now,
+        ):
+            return
+        self._last_motion_analysis_monotonic = now
+        self._motion_level = self._compute_motion_level(frame)
+
+    def _visual_overlays_needed(self) -> bool:
+        s = self.motion_settings
+        return visual_overlays_needed(
+            show_live_overlay=s.show_live_overlay,
+            show_configured_zones=s.show_configured_zones,
+            privacy_mask_overlay=s.privacy_mask_overlay,
+            has_privacy_masks=bool(self._privacy_masks),
+            flash_alarm_border=s.flash_alarm_border,
+            alarm_active=bool(self._camera_alarm_active),
+            debug_fsm_overlay=s.debug_fsm_overlay,
+        )
+
+    def _get_label_display_size(self, frame) -> tuple:
+        """Solo usa estado cacheado; sin llamadas Tk (puede ejecutarse en hilo prep)."""
+        if self._display_size and self._display_size[0] > 1 and self._display_size[1] > 1:
+            return self._display_size
+        h, w = frame.shape[:2]
+        return (max(1, w), max(1, h))
+
+    def _prepare_display_frame(self, frame) -> Optional[_PreparedDisplay]:
+        if frame is None:
+            return None
+        display_width, display_height = self._get_label_display_size(frame)
+        height, width = frame.shape[:2]
+        if display_width > 1 and display_height > 1:
+            scale = min(display_width / width, display_height / height)
+            new_width = max(1, int(width * scale))
+            new_height = max(1, int(height * scale))
+            interp = cv2.INTER_AREA if new_width < width else cv2.INTER_LINEAR
+            frame_resized = cv2.resize(
+                frame, (new_width, new_height), interpolation=interp,
+            )
+        else:
+            frame_resized = frame
+            new_width, new_height = frame.shape[1], frame.shape[0]
+
+        self.current_frame = frame
+        self._maybe_update_motion(frame)
+        src_h, src_w = frame.shape[:2]
+
+        display_frame = frame_resized
+        if getattr(self, "_digital_crop", None) is not None:
+            crop = self._digital_crop
+            sh, sw = frame.shape[:2]
+            x1, y1, x2, y2 = crop
+            scale_x = new_width / max(1, sw)
+            scale_y = new_height / max(1, sh)
+            cx1 = int(x1 * scale_x)
+            cy1 = int(y1 * scale_y)
+            cx2 = max(cx1 + 2, int(x2 * scale_x))
+            cy2 = max(cy1 + 2, int(y2 * scale_y))
+            cropped = display_frame[cy1:cy2, cx1:cx2]
+            if cropped.size > 0:
+                display_frame = cv2.resize(
+                    cropped, (new_width, new_height), interpolation=cv2.INTER_LINEAR,
+                )
+
+        if self.motion_settings.heatmap.enabled:
+            display_frame = self._heatmap.overlay(display_frame)
+
+        if self._visual_overlays_needed():
+            now = time.time()
+            if self.motion_settings.flash_alarm_border and self._camera_alarm_active:
+                if now - self._alarm_flash_ts > 0.5:
+                    self._alarm_flash_on = not self._alarm_flash_on
+                    self._alarm_flash_ts = now
+            else:
+                self._alarm_flash_on = False
+
+            debug_text = None
+            if self.motion_settings.debug_fsm_overlay:
+                az = self._auto_zoom
+                debug_text = (
+                    f"{az.state.value} | {self._motion_level:.0f}% | "
+                    f"boxes={len(self._motion_boxes)} | "
+                    f"ptz={az.has_ptz} opt={az.has_optical_zoom}"
+                )
+
+            display_frame = draw_motion_overlays(
+                display_frame,
+                self.motion_settings,
+                self._motion_boxes,
+                self._md_info,
+                self._privacy_masks if self.motion_settings.privacy_mask_overlay else None,
+                self._motion_level,
+                (src_w, src_h),
+                (new_width, new_height),
+                debug_text=debug_text,
+                alarm_flash=self._alarm_flash_on,
+            )
+
+        frame_rgb = cv2.cvtColor(display_frame, cv2.COLOR_BGR2RGB)
+        return _PreparedDisplay(
+            rgb=frame_rgb,
+            stream_w=width,
+            stream_h=height,
+            display_label_w=display_width,
+            display_label_h=display_height,
+        )
+
+    def _rgb_to_photoimage(self, rgb_array):
+        try:
+            h, w = rgb_array.shape[:2]
+            header = f"P6 {w} {h} 255 ".encode("ascii")
+            data = header + rgb_array.tobytes()
+            return tk.PhotoImage(master=self.root, data=data, format="PPM")
+        except tk.TclError:
+            image = Image.fromarray(rgb_array)
+            return ImageTk.PhotoImage(image=image, master=self.root)
+
+    def _tick_display_fps(self) -> None:
+        now = time.monotonic()
+        self._display_fps_window_count += 1
+        elapsed = now - self._display_fps_window_start
+        if elapsed >= 0.5:
+            self._display_fps = self._display_fps_window_count / elapsed
+            self._display_fps_window_count = 0
+            self._display_fps_window_start = now
+        if self.is_streaming and self._display_fps > 0:
+            self.ui.set_display_fps(self._display_fps)
+
+    def _schedule_next_display(self, painted: bool) -> None:
+        if not self._ui_active:
+            return
+        elapsed_ms = 0.0
+        if painted:
+            elapsed_ms = (time.monotonic() - self._last_paint_monotonic) * 1000.0
+        depth = self.display_queue.qsize()
+        if not painted:
+            depth = max(depth, self.frame_queue.qsize())
+        delay = next_display_delay_ms(depth, elapsed_ms)
+        try:
+            self.root.after(delay, self._update_display_loop)
+        except tk.TclError:
+            pass
+
+    def _display_prep_loop(self) -> None:
+        while not self._display_prep_stop.is_set():
+            if not self.is_streaming:
+                time.sleep(0.05)
+                continue
+            try:
+                frame = self.frame_queue.get(timeout=0.1)
+            except queue.Empty:
+                continue
+            while True:
+                try:
+                    frame = self.frame_queue.get_nowait()
+                except queue.Empty:
+                    break
+            try:
+                prepared = self._prepare_display_frame(frame)
+                if prepared is None:
+                    continue
+                try:
+                    self.display_queue.put_nowait(prepared)
+                except queue.Full:
+                    try:
+                        self.display_queue.get_nowait()
+                    except queue.Empty:
+                        pass
+                    try:
+                        self.display_queue.put_nowait(prepared)
+                    except queue.Full:
+                        pass
+            except Exception:
+                pass
+
     def _meter_ui_loop(self):
         try:
             level_db = self._audio_level_db_ema
@@ -1740,8 +1961,6 @@ class FoscamViewer:
     
     def _video_reader_thread(self):
         """Thread to continuously read frames from RTSP stream."""
-        # Limitar lectura a ~40 fps para no saturar av_frame_get_buffer (evitar OOM con FFmpeg)
-        read_interval = 0.025
         while self.is_streaming and self.cap is not None:
             try:
                 ret, frame = self.cap.read()
@@ -1754,6 +1973,8 @@ class FoscamViewer:
                             self.frame_queue.put_nowait(frame)
                         except queue.Empty:
                             pass
+                    if self.frame_queue.full():
+                        time.sleep(READER_QUEUE_FULL_SLEEP_SEC)
                 else:
                     # Stream ended or error
                     if self.is_streaming:
@@ -1766,7 +1987,6 @@ class FoscamViewer:
                         if self.is_streaming:
                             self._start_stream()
                         break
-                time.sleep(read_interval)
             except Exception as e:
                 if self.is_streaming:
                     self.root.after(0, lambda: self._set_connection_state("reconnecting"))
@@ -1782,103 +2002,42 @@ class FoscamViewer:
             return
         self._display_size = (event.width, event.height)
 
+    def _refresh_display_size_from_label(self) -> None:
+        """Actualiza _display_size desde Tk (solo hilo principal)."""
+        label = getattr(self, "video_label", None)
+        if label is None:
+            return
+        w, h = label.winfo_width(), label.winfo_height()
+        if w > 1 and h > 1:
+            self._display_size = (w, h)
+
     def _update_display_loop(self):
-        """Actualiza el vídeo con el último frame de la cola (ImageTk, más liviano que CTkImage)."""
+        """Pinta el último frame preparado; el trabajo pesado va en _display_prep_loop."""
+        self._refresh_display_size_from_label()
+        painted = False
         try:
-            frame = None
+            prepared = None
             while True:
                 try:
-                    frame = self.frame_queue.get_nowait()
+                    prepared = self.display_queue.get_nowait()
                 except queue.Empty:
                     break
 
-            if frame is not None:
-                if self._display_size and self._display_size[0] > 1 and self._display_size[1] > 1:
-                    display_width, display_height = self._display_size
-                else:
-                    display_width = self.video_label.winfo_width()
-                    display_height = self.video_label.winfo_height()
-
-                if display_width > 1 and display_height > 1:
-                    height, width = frame.shape[:2]
-                    scale = min(display_width / width, display_height / height)
-                    new_width = max(1, int(width * scale))
-                    new_height = max(1, int(height * scale))
-                    interp = cv2.INTER_AREA if new_width < width else cv2.INTER_LINEAR
-                    frame_resized = cv2.resize(
-                        frame, (new_width, new_height), interpolation=interp,
-                    )
-                else:
-                    frame_resized = frame
-                    new_width, new_height = frame.shape[1], frame.shape[0]
-
-                self.current_frame = frame
-                self._motion_level = self._compute_motion_level(frame)
-                src_h, src_w = frame.shape[:2]
-
-                display_frame = frame_resized
-                if getattr(self, "_digital_crop", None) is not None:
-                    crop = self._digital_crop
-                    sh, sw = frame.shape[:2]
-                    x1, y1, x2, y2 = crop
-                    scale_x = new_width / max(1, sw)
-                    scale_y = new_height / max(1, sh)
-                    cx1 = int(x1 * scale_x)
-                    cy1 = int(y1 * scale_y)
-                    cx2 = max(cx1 + 2, int(x2 * scale_x))
-                    cy2 = max(cy1 + 2, int(y2 * scale_y))
-                    cropped = display_frame[cy1:cy2, cx1:cx2]
-                    if cropped.size > 0:
-                        display_frame = cv2.resize(
-                            cropped, (new_width, new_height), interpolation=cv2.INTER_LINEAR,
-                        )
-
-                if self.motion_settings.heatmap.enabled:
-                    display_frame = self._heatmap.overlay(display_frame)
-
-                now = time.time()
-                if self.motion_settings.flash_alarm_border and self._camera_alarm_active:
-                    if now - self._alarm_flash_ts > 0.5:
-                        self._alarm_flash_on = not self._alarm_flash_on
-                        self._alarm_flash_ts = now
-                else:
-                    self._alarm_flash_on = False
-
-                debug_text = None
-                if self.motion_settings.debug_fsm_overlay:
-                    az = self._auto_zoom
-                    debug_text = (
-                        f"{az.state.value} | {self._motion_level:.0f}% | "
-                        f"boxes={len(self._motion_boxes)} | "
-                        f"ptz={az.has_ptz} opt={az.has_optical_zoom}"
-                    )
-
-                display_frame = draw_motion_overlays(
-                    display_frame,
-                    self.motion_settings,
-                    self._motion_boxes,
-                    self._md_info,
-                    self._privacy_masks if self.motion_settings.privacy_mask_overlay else None,
-                    self._motion_level,
-                    (src_w, src_h),
-                    (new_width, new_height),
-                    debug_text=debug_text,
-                    alarm_flash=self._alarm_flash_on,
-                )
-
-                frame_rgb = cv2.cvtColor(display_frame, cv2.COLOR_BGR2RGB)
-                image = Image.fromarray(frame_rgb)
-                size = (new_width, new_height)
-                self._video_photo = ImageTk.PhotoImage(image=image)
-                self._last_image_size = size
+            if prepared is not None:
+                self._video_photo = self._rgb_to_photoimage(prepared.rgb)
+                self._last_image_size = (prepared.rgb.shape[1], prepared.rgb.shape[0])
                 self.video_label.configure(image=self._video_photo, text="")
                 self.video_label.image = self._video_photo
 
-                h, w = frame.shape[:2]
-                self.resolution_var.set(f"{w}×{h}")
-                if display_width > 1 and display_height > 1:
-                    self.display_size_var.set(f"Display {display_width}×{display_height}")
+                self.resolution_var.set(f"{prepared.stream_w}×{prepared.stream_h}")
+                if prepared.display_label_w > 1 and prepared.display_label_h > 1:
+                    self.display_size_var.set(
+                        f"Display {prepared.display_label_w}×{prepared.display_label_h}",
+                    )
                 self._display_frame_count += 1
+                self._tick_display_fps()
+                self._last_paint_monotonic = time.monotonic()
+                painted = True
                 if self._display_frame_count % DISPLAY_DETAIL_EVERY_N == 0:
                     self._update_technical_details()
 
@@ -1886,11 +2045,7 @@ class FoscamViewer:
             if self.is_streaming and self._ui_active:
                 self._set_status_short(f"Display error: {str(e)}")
 
-        if self._ui_active:
-            try:
-                self.root.after(DISPLAY_INTERVAL_MS, self._update_display_loop)
-            except tk.TclError:
-                pass
+        self._schedule_next_display(painted)
     
     def _update_ui_connected(self):
         """Update UI after successful connection."""
@@ -2050,13 +2205,18 @@ class FoscamViewer:
                 self.cap.release()
                 self.cap = None
         
-        # Clear frame queue
-        while not self.frame_queue.empty():
-            try:
-                self.frame_queue.get_nowait()
-            except queue.Empty:
-                break
-        
+        # Clear frame queues
+        for q in (self.frame_queue, self.display_queue):
+            while not q.empty():
+                try:
+                    q.get_nowait()
+                except queue.Empty:
+                    break
+        self._display_fps = 0.0
+        self._display_fps_window_count = 0
+        self._motion_display_frame_index = 0
+        self.ui.set_display_fps(None)
+
         self.current_frame = None
         self.video_label.configure(image="", text="Desconectado")
         self.video_label.image = None
@@ -2095,6 +2255,7 @@ class FoscamViewer:
         self._close_started = True
         self._shutting_down = True
         self._ui_active = False
+        self._display_prep_stop.set()
         self._cancel_pending_after(all_callbacks=True)
         try:
             self._save_window_geometry()

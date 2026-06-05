@@ -31,17 +31,21 @@ class StatusPill(ctk.CTkFrame):
     }
 
     def __init__(self, master, **kwargs):
-        super().__init__(master, fg_color="transparent", corner_radius=12, **kwargs)
+        panel = th.chrome_panel_kwargs(corner_radius=12)
+        panel.update(kwargs)
+        super().__init__(master, **panel)
         self._dot = ctk.CTkLabel(self, text="●", width=16, font=ctk.CTkFont(size=14))
         self._dot.pack(side=tk.LEFT, padx=(10, 4), pady=6)
-        self._label = ctk.CTkLabel(self, text="Conectando", font=th.small_font())
+        self._label = ctk.CTkLabel(
+            self, text="Conectando", font=th.small_font(), text_color=th.TEXT,
+        )
         self._label.pack(side=tk.LEFT, padx=(0, 10), pady=6)
         self.set_state("connecting")
 
     def set_state(self, state: str) -> None:
         color, text = self._STYLES.get(state, self._STYLES["connecting"])
         self._dot.configure(text_color=color)
-        self._label.configure(text=text)
+        self._label.configure(text=text, text_color=th.TEXT)
 
 
 class SectionCard(ctk.CTkFrame):
@@ -135,9 +139,8 @@ class PtzPad(ctk.CTkFrame):
         for (r, c), cmd in cmds.items():
             btn = ctk.CTkButton(
                 self, text=labels[(r, c)], width=36, height=32,
-                fg_color="transparent", border_width=1, border_color=th.TEXT_MUTED,
-                hover_color=th.OVERLAY_HOVER,
-                text_color=th.TEXT, font=ctk.CTkFont(size=13),
+                **th.chrome_button_kwargs(),
+                font=ctk.CTkFont(size=13),
             )
             btn.grid(row=r, column=c, padx=2, pady=2)
             btn.bind("<ButtonPress-1>", lambda e, command=cmd: self._press(command))
@@ -169,9 +172,8 @@ class IndicatorStrip(ctk.CTkFrame):
         self.status_pill.pack(side=tk.LEFT)
         self.hud_btn = ctk.CTkButton(
             header, text="H●", width=32, height=26,
-            fg_color="transparent", border_width=1, border_color=th.TEXT_MUTED,
-            hover_color=th.OVERLAY_HOVER,
-            text_color=th.TEXT, font=th.small_font(),
+            **th.chrome_button_kwargs(),
+            font=th.small_font(),
             command=on_toggle_hud or (lambda: None),
         )
         self.hud_btn.pack(side=tk.RIGHT)
@@ -209,7 +211,7 @@ class IndicatorStrip(ctk.CTkFrame):
         self.gate_state_badge = ctk.CTkLabel(
             gate_row, textvariable=self._gate_state_var,
             font=th.small_font(), text_color=th.TEXT_MUTED,
-            fg_color="transparent", corner_radius=6,
+            fg_color=th.CHROME_BTN_BG, corner_radius=6,
         )
         self.gate_state_badge.pack(side=tk.RIGHT)
 
@@ -222,7 +224,7 @@ class IndicatorStrip(ctk.CTkFrame):
         self.alarm_badge = ctk.CTkLabel(
             alarm_row, textvariable=self._camera_alarm_label_var,
             font=th.small_font(), text_color=th.TEXT_MUTED,
-            fg_color="transparent", corner_radius=6,
+            fg_color=th.CHROME_BTN_BG, corner_radius=6,
         )
         self.alarm_badge.pack(side=tk.RIGHT)
         self._camera_alarm_meter = ctk.CTkProgressBar(inner, height=8)
@@ -242,18 +244,18 @@ class IndicatorStrip(ctk.CTkFrame):
     def set_gate_state(self, open_: Optional[bool]) -> None:
         if open_ is None:
             self._gate_state_var.set("N/D")
-            self.gate_state_badge.configure(text_color=th.TEXT_MUTED, fg_color="transparent")
+            self.gate_state_badge.configure(text_color=th.TEXT_MUTED, fg_color=th.CHROME_BTN_BG)
         elif open_:
             self._gate_state_var.set("ABIERTA")
-            self.gate_state_badge.configure(text_color=th.GATE_OPEN, fg_color="transparent")
+            self.gate_state_badge.configure(text_color=th.GATE_OPEN, fg_color=th.CHROME_BTN_BG)
         else:
             self._gate_state_var.set("CERRADA")
-            self.gate_state_badge.configure(text_color=th.GATE_CLOSED, fg_color="transparent")
+            self.gate_state_badge.configure(text_color=th.GATE_CLOSED, fg_color=th.CHROME_BTN_BG)
 
     def set_alarm_badge(self, state: Optional[bool]) -> None:
         if state is None:
-            self.alarm_badge.configure(text_color=th.TEXT_MUTED, fg_color="transparent")
+            self.alarm_badge.configure(text_color=th.TEXT_MUTED, fg_color=th.CHROME_BTN_BG)
         elif state:
-            self.alarm_badge.configure(text_color=th.STATE_ALARM, fg_color="transparent")
+            self.alarm_badge.configure(text_color=th.STATE_ALARM, fg_color=th.CHROME_BTN_BG)
         else:
-            self.alarm_badge.configure(text_color=th.STATE_OK, fg_color="transparent")
+            self.alarm_badge.configure(text_color=th.STATE_OK, fg_color=th.CHROME_BTN_BG)

@@ -19,17 +19,23 @@ BG_APP = "#0f1117"
 BG_VIDEO = "#000000"
 BG_CARD = "#141820"
 BG_ELEVATED = "#1c2230"
-OVERLAY_BG = "#141820"
-OVERLAY_BORDER = "#2a3140"
-OVERLAY_HOVER = "#1c2230"
+CHROME_BG = "#222a38"
+CHROME_BTN_BG = "#2d3648"
+CHROME_BTN_BORDER = "#5a6478"
+CHROME_BTN_HOVER = "#3d4a62"
+OVERLAY_BG = "#1e2636"
+OVERLAY_BORDER = "#5a6478"
+OVERLAY_HOVER = CHROME_BTN_HOVER
 
 ACCENT = "#26b5a8"
 ACCENT_HOVER = "#32c9bb"
 ACCENT_MUTED = "#1a6f68"
 ACCENT_SOFT = "#1e8a80"
 
-TEXT = "#e8eaed"
-TEXT_MUTED = "#9aa3b2"
+TEXT = "#f0f2f5"
+TEXT_MUTED = "#b8c0d0"
+TEXT_GHOST = "#3a4254"
+TEXT_GHOST_MUTED = "#2a3040"
 
 STATE_LIVE = "#4ade80"
 STATE_ALARM = "#fbbf24"
@@ -78,6 +84,33 @@ def overlay_panel_kwargs(*, corner_radius: int = 12) -> dict:
         "border_width": 1,
         "border_color": OVERLAY_BORDER,
         "corner_radius": corner_radius,
+    }
+
+
+def chrome_panel_kwargs(*, corner_radius: int = 10) -> dict:
+    """Panel legible sobre vídeo negro (toolbar, footer, pills)."""
+    return {
+        "fg_color": CHROME_BG,
+        "border_width": 1,
+        "border_color": CHROME_BTN_BORDER,
+        "corner_radius": corner_radius,
+    }
+
+
+def chrome_button_kwargs(*, accent: bool = False, danger: bool = False) -> dict:
+    """Botón con fondo sólido; evita negro sobre negro en el HUD."""
+    if accent:
+        border, text = ACCENT, ACCENT
+    elif danger:
+        border, text = DANGER, TEXT
+    else:
+        border, text = CHROME_BTN_BORDER, TEXT
+    return {
+        "fg_color": CHROME_BTN_BG,
+        "border_width": 1,
+        "border_color": border,
+        "text_color": text,
+        "hover_color": CHROME_BTN_HOVER,
     }
 
 
