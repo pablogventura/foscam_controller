@@ -6,7 +6,7 @@ from typing import Optional, Tuple
 
 import customtkinter as ctk
 
-DEFAULT_UI_SCALE = 2.0
+DEFAULT_UI_SCALE = 1.5
 _UI_SCALE = DEFAULT_UI_SCALE
 
 SIDEBAR_WIDTH_BASE = 300

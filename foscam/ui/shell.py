@@ -40,7 +40,7 @@ Indicador Puerta: ABIERTA / CERRADA según el bloque actual del stream.
 NVIDIA: si hay GPU, se usa automáticamente (--no-nvidia fuerza CPU).
 Diagnóstico gate: --audio-gate-debug o FOSCAM_AUDIO_GATE_DEBUG=1.
 
-Escala UI: --ui-scale 2.0 (o clave ui_scale en viewer.json)."""
+Escala UI: --ui-scale 1.5 (o clave ui_scale en viewer.json)."""
 
 
 class ViewerShell:

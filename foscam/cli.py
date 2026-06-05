@@ -168,7 +168,7 @@ Ejemplos:
         type=float,
         default=None,
         metavar="FACTOR",
-        help="Escala UI (default: viewer.json o 2.0). Ej: 1.5, 2.0",
+        help="Escala UI (default: viewer.json o 1.5). Ej: 1.5, 2.0",
     )
     mg = p_view.add_argument_group("movimiento")
     mg.add_argument("--motion-live-overlay", action="store_true")

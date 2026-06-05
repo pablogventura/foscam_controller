@@ -2198,7 +2198,7 @@ Sin ellos se usa ffplay en subproceso (sin sync perfecto).
         default=None,
         metavar='FACTOR',
         help=(
-            'Escala de la interfaz CustomTkinter (default: valor en viewer.json o 2.0). '
+            'Escala de la interfaz CustomTkinter (default: valor en viewer.json o 1.5). '
             'Ej: 1.5, 2.0, 2.5. Afecta controles y tamaño sugerido de ventana.'
         ),
     )
