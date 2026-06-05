@@ -733,7 +733,11 @@ class AutoZoomController:
         now = time.time()
         dt = max(0.001, now - self._last_tick)
         self._last_tick = now
-        moving = level >= self.settings.trigger_level and bool(boxes)
+        has_boxes = bool(boxes)
+        if self.state in (ZoomState.ZOOMING_IN, ZoomState.ZOOMED_HOLD):
+            moving = has_boxes
+        else:
+            moving = has_boxes and level >= self.settings.trigger_level
 
         if moving:
             self._idle_since = None
@@ -752,6 +756,9 @@ class AutoZoomController:
                 self.state = ZoomState.ZOOMING_IN
                 self._snapshot_fired = False
                 self._optical_steps = 0
+                ubox = union_box(boxes)
+                if ubox:
+                    self._update_target_crop(ubox, fw, fh, az)
 
         if self.state == ZoomState.ZOOMING_IN:
             if not moving:
@@ -762,7 +769,7 @@ class AutoZoomController:
                     self._update_target_crop(ubox, fw, fh, az)
                 self._digital_factor = min(
                     az.max_digital,
-                    self._digital_factor + az.zoom_in_speed * dt * 0.5,
+                    self._digital_factor + az.zoom_in_speed * dt * 1.2,
                 )
                 self._apply_ptz_toward_box(boxes, fw, fh, mode, action, zoom_in=True)
                 if self._digital_factor >= az.max_digital or self._reached_target_fill(boxes, fw, fh, az):
@@ -798,13 +805,31 @@ class AutoZoomController:
         action.state_label = self.STATE_LABELS.get(self.state, "normal")
         return action
 
+    def _box_fill_in_frame(
+        self,
+        box: Tuple[int, int, int, int],
+        crop: Optional[Tuple[int, int, int, int]],
+        fw: int,
+        fh: int,
+    ) -> float:
+        x1, y1, x2, y2 = box
+        if crop is None:
+            return ((x2 - x1) * (y2 - y1)) / max(1, fw * fh)
+        cx1, cy1, cx2, cy2 = crop
+        ix1, iy1 = max(x1, cx1), max(y1, cy1)
+        ix2, iy2 = min(x2, cx2), min(y2, cy2)
+        if ix2 <= ix1 or iy2 <= iy1:
+            return 0.0
+        return ((ix2 - ix1) * (iy2 - iy1)) / max(1, fw * fh)
+
     def _reached_target_fill(self, boxes, fw, fh, az) -> bool:
         ubox = union_box(boxes)
         if not ubox:
             return False
-        x1, y1, x2, y2 = ubox
-        fill = ((x2 - x1) * (y2 - y1)) / max(1, fw * fh)
-        return fill >= az.target_fill_ratio
+        mode = self._effective_mode()
+        if mode in ("digital", "ptz_pan_digital_zoom"):
+            return self._digital_factor >= az.max_digital - 0.02
+        return self._box_fill_in_frame(ubox, None, fw, fh) >= az.target_fill_ratio
 
     def _update_target_crop(self, box, fw, fh, az) -> None:
         x1, y1, x2, y2 = expand_box(box, self.settings.crop_margin_pct, fw, fh)

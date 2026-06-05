@@ -103,6 +103,23 @@ def test_auto_zoom_fsm_transitions():
     assert ctrl.state == ZoomState.RETURNING
 
 
+def test_auto_zoom_large_box_still_crops():
+    settings = MotionSettings(
+        trigger_level=10,
+        trigger_hold_sec=0.0,
+        auto_zoom=AutoZoomSettings(enabled=True, mode="digital", max_digital=3.0),
+    )
+    ctrl = AutoZoomController(settings)
+    large_box = (80, 60, 560, 420)
+    action = None
+    for _ in range(40):
+        action = ctrl.tick(25.0, [large_box], (640, 480), gate_open=True)
+        time.sleep(0.02)
+    assert ctrl.state in (ZoomState.ZOOMING_IN, ZoomState.ZOOMED_HOLD)
+    assert ctrl._digital_factor > 1.2
+    assert action is not None and action.digital_crop is not None
+
+
 def test_load_motion_settings_merge():
     prefs = {"motion": {"sensitivity": 40, "auto_zoom": {"enabled": True}}}
     s = load_motion_settings(prefs, {"sensitivity": 55})
