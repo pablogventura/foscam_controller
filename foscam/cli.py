@@ -63,6 +63,28 @@ def cmd_view(args) -> None:
         sys.argv.extend(["--audio-gate-db", str(args.audio_gate_db)])
     if getattr(args, "ui_scale", None) is not None:
         sys.argv.extend(["--ui-scale", str(args.ui_scale)])
+    if getattr(args, "motion_live_overlay", False):
+        sys.argv.append("--motion-live-overlay")
+    if getattr(args, "no_motion_live_overlay", False):
+        sys.argv.append("--no-motion-live-overlay")
+    if getattr(args, "motion_zones_overlay", False):
+        sys.argv.append("--motion-zones-overlay")
+    if getattr(args, "no_motion_zones_overlay", False):
+        sys.argv.append("--no-motion-zones-overlay")
+    if getattr(args, "auto_zoom", False):
+        sys.argv.append("--auto-zoom")
+    if getattr(args, "no_auto_zoom", False):
+        sys.argv.append("--no-auto-zoom")
+    if getattr(args, "motion_sensitivity", None) is not None:
+        sys.argv.extend(["--motion-sensitivity", str(args.motion_sensitivity)])
+    if getattr(args, "auto_zoom_return_sec", None) is not None:
+        sys.argv.extend(["--auto-zoom-return-sec", str(args.auto_zoom_return_sec)])
+    if getattr(args, "auto_zoom_mode", None):
+        sys.argv.extend(["--auto-zoom-mode", args.auto_zoom_mode])
+    if getattr(args, "motion_profile", None):
+        sys.argv.extend(["--motion-profile", args.motion_profile])
+    if getattr(args, "motion_config", None):
+        sys.argv.extend(["--motion-config", args.motion_config])
     viewer_main()
 
 
@@ -148,6 +170,22 @@ Ejemplos:
         metavar="FACTOR",
         help="Escala UI (default: viewer.json o 2.0). Ej: 1.5, 2.0",
     )
+    mg = p_view.add_argument_group("movimiento")
+    mg.add_argument("--motion-live-overlay", action="store_true")
+    mg.add_argument("--no-motion-live-overlay", action="store_true")
+    mg.add_argument("--motion-zones-overlay", action="store_true")
+    mg.add_argument("--no-motion-zones-overlay", action="store_true")
+    mg.add_argument("--auto-zoom", action="store_true")
+    mg.add_argument("--no-auto-zoom", action="store_true")
+    mg.add_argument("--motion-sensitivity", type=float, default=None, metavar="0-100")
+    mg.add_argument("--auto-zoom-return-sec", type=float, default=None)
+    mg.add_argument(
+        "--auto-zoom-mode",
+        choices=["auto", "digital", "ptz", "ptz_pan_digital_zoom"],
+        default=None,
+    )
+    mg.add_argument("--motion-profile", type=str, default=None)
+    mg.add_argument("--motion-config", type=str, default=None, metavar="PATH")
     p_view.set_defaults(func=cmd_view)
 
     # console

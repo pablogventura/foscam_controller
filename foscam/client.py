@@ -95,3 +95,54 @@ class FoscamClient:
     def get_dev_name(self) -> Optional[str]:
         """Nombre del dispositivo."""
         return self.send("getDevName")
+
+    def get_motion_detect_config(self, variant: str = "config") -> Optional[str]:
+        """Configuración de detección de movimiento (config / config1 / config2)."""
+        cmd_map = {
+            "config": "getMotionDetectConfig",
+            "config1": "getMotionDetectConfig1",
+            "config2": "getMotionDetectConfig2",
+        }
+        cmd = cmd_map.get(variant, "getMotionDetectConfig")
+        return self.send(cmd)
+
+    def get_osd_mask_area(self) -> Optional[str]:
+        return self.send("getOsdMaskArea")
+
+    def get_ptz_speed(self) -> Optional[str]:
+        return self.send("getPTZSpeed")
+
+    def get_zoom_speed(self) -> Optional[str]:
+        return self.send("getZoomSpeed")
+
+    def set_ptz_speed(self, speed: int) -> Optional[str]:
+        return self.send("setPTZSpeed", {"speed": int(speed)})
+
+    def zoom_in(self) -> Optional[str]:
+        return self.send("zoomIn")
+
+    def zoom_out(self) -> Optional[str]:
+        return self.send("zoomOut")
+
+    def zoom_stop(self) -> Optional[str]:
+        return self.send("zoomStop")
+
+    def probe_ptz_capabilities(self) -> tuple:
+        """Devuelve (has_ptz, has_optical_zoom) según respuestas CGI."""
+        has_ptz = False
+        has_optical = False
+        for cmd, resp in (
+            ("getPTZSpeed", self.get_ptz_speed()),
+            ("getZoomSpeed", self.get_zoom_speed()),
+        ):
+            if resp and "error" not in resp.lower():
+                if cmd == "getPTZSpeed":
+                    has_ptz = True
+                else:
+                    has_optical = True
+        if not has_ptz:
+            move = self.send("ptzMoveRight")
+            if move and "error" not in move.lower():
+                has_ptz = True
+            self.ptz_stop()
+        return has_ptz, has_optical
