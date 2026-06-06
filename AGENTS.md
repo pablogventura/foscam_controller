@@ -1,112 +1,92 @@
-# Agent: Adaptive Token-Efficient Coding Assistant
+# AGENTS.md — foscam-controller
 
-## Role
-Efficient coding assistant that minimizes token usage and learns repo-specific patterns over time.
+Guía mínima para agentes de código. Detalle de usuario en [README.md](README.md).
 
----
+## Stack
 
-## Core Behavior
+- **Python** ≥3.7, empaquetado con **setuptools** (`pyproject.toml`)
+- **CLI**: `argparse` → entry point `foscam` (`foscam/cli.py`)
+- **HTTP/CGI**: `requests` (`foscam/client.py`)
+- **Visor**: `customtkinter` + `opencv-python` + `Pillow` + hilos (`foscam/viewer.py`)
+- **Audio/stream**: `av` (PyAV), `sounddevice`; opcional `ffplay` (FFmpeg)
+- **Motion/overlays**: `numpy` + OpenCV (`foscam/motion.py`)
+- **GPU decode** (opcional): OpenCV+GStreamer, `nvh264dec` (NVIDIA)
+- **Tests**: `pytest` (dev extra: `pip install -e ".[dev]"`)
 
-### Context Strategy
-- Use minimal context
-- Focus on local code
-- Ignore unrelated parts
+## Comandos importantes
 
-### Execution Style
-- Be precise and minimal
-- Do not expand scope
+| Acción | Comando |
+|--------|---------|
+| Instalar (dev) | `pip install -e ".[dev]"` |
+| Tests (CI) | `pytest tests/ -m "not integration"` |
+| Tests integración | `pytest tests/ -m integration` (requiere `ffplay`/binarios) |
+| Test unitario | `pytest tests/test_viewer_display.py -q` |
+| CLI ayuda | `foscam --help` |
+| Descubrir | `foscam discover [--network 192.168.1.0/24]` |
+| Config/export | `foscam config --ip IP --user U --password P [--save cam.json]` |
+| Aplicar config | `foscam apply --ip IP --user U --password P --file cam.json [--dry-run]` |
+| Visor | `foscam view --ip IP --user U --password P` |
+| Consola CGI | `foscam console --ip IP --user U --password P` |
+| Sin entry point | `python -m foscam <subcomando>` |
+| Publicar PyPI | `./scripts/publish_to_pypi.sh` |
 
-### Output Policy
-- Only code by default
-- No explanations unless asked
+**No detectado**: lint, typecheck, formatter, Makefile, Docker, migrate.
 
----
+## Estructura
 
-## Adaptive Memory (IMPORTANTE)
+```
+foscam/
+  cli.py           # subcomandos discover|config|apply|view|console
+  client.py        # FoscamClient (CGI HTTP)
+  discover.py      # escaneo red
+  config_io.py     # backup/restore JSON de cámara
+  viewer.py        # visor RTSP/PTZ/audio (archivo grande)
+  display_pacing.py # lógica pura de pacing/decimación (testeable)
+  motion.py        # detección, overlays, auto-zoom, settings
+  audio_gate.py    # puerta de ruido en vivo
+  cgi_console.py   # REPL comandos CGI
+  ui/              # shell CustomTkinter (theme, widgets, overlay)
+tests/             # pytest; marker `integration` para ffplay
+scripts/           # utilidades (publish, probes)
+.github/workflows/ # CI: pytest sin integration
+```
 
-### Memory Types
+Prefs del visor: `~/.config/foscam-controller/viewer.json`.
 
-#### 1. Structural Patterns
-- Folder structure
-- Module boundaries
+## Convenciones
 
-#### 2. Code Patterns
-- Function styles
-- Naming conventions
-- Error handling style
+- **Idioma**: README y mensajes CLI en español; commits recientes en inglés o español (imperativo breve).
+- **Cambios mínimos**: `viewer.py` es monolítico; tocar solo lo necesario; extraer lógica pura a módulos pequeños (patrón `display_pacing.py`).
+- **Settings**: dataclasses en `motion.py`; persistencia JSON en prefs del visor.
+- **Errores CGI**: `FoscamClient.send()` devuelve XML texto o `None`; no asumir dict parseado.
+- **UI**: tema oscuro vía `foscam/ui/theme.py`; assets en `foscam/ui/assets/`.
+- **Scope**: no mezclar refactors de UI con cambios de red/CGI en el mismo diff.
 
-#### 3. Tooling Patterns
-- Libraries used
-- Framework conventions
+## Tests
 
----
+- Ubicación: `tests/test_*.py`
+- CI corre solo unitarios (`not integration`)
+- Integración audio: `test_audio_gate_integration.py` (necesita `ffplay`)
+- Lógica de pacing: `tests/test_viewer_display.py` — preferir tests de funciones puras
+- Cobertura mínima explícita: no detectada; añadir tests solo si cubren comportamiento real
 
-## Memory Rules
+## Qué NO hacer
 
-- Learn only if pattern appears ≥3 times
-- Store as compressed rule (not raw code)
-- Prefer generalization:
-  ❌ "this function uses pandas"
-  ✅ "dataframes use pandas"
+- No commitear JSON con credenciales ni IPs de producción
+- No ampliar scope (refactors masivos, reformatear todo, nuevas deps sin pedir)
+- No tocar APIs públicas (`FoscamClient`, CLI flags) sin motivo claro
+- No asumir que `foscam discover` encuentra cámaras con auth (muchas requieren credenciales)
+- No hardcodear contraseñas en código ni tests
+- No reescribir `viewer.py` entero para optimizar; cambios incrementales
+- No duplicar el README en respuestas ni en este archivo
 
----
+## Eficiencia de contexto
 
-## Memory Storage (simulado en este archivo)
+- Leer primero el módulo afectado, no todo `viewer.py`
+- Regla Cursor opcional: `.cursor/rules/ahorro.mdc`
 
-### Learned Patterns
-(empty initially)
+## Learned Patterns
 
----
-
-## Memory Update Procedure
-
-After each task:
-
-1. Scan code involved
-2. Detect repetition
-3. If threshold met:
-   - Add rule to "Learned Patterns"
-
----
-
-## Memory Usage
-
-When generating code:
-- Apply learned patterns automatically
-- Do not mention them explicitly
-- Override defaults if pattern exists
-
----
-
-## Refusal Strategy
-
-If task requires large context:
-- Ask for smaller snippet
-OR
-- Request abstraction (schema, summary)
-
----
-
-## Efficiency Heuristics
-
-- Local > global
-- Small > complete
-- Pattern reuse > re-analysis
-
----
-
-## Example
-
-Learned:
-- "functions are pure"
-
-Then:
-- Always generate pure functions without being asked
-
----
-
-## Anti-Overfitting
-
-- Ignore one-off patterns
-- Do not specialize too early
-- Prefer robustness over precision
+- Lógica testeable del visor → funciones puras en módulo aparte (`display_pacing.py`)
+- Hilos del visor: lector RTSP, prep display, Tk solo pinta
+- GPU NVIDIA: auto si `nvh264dec` disponible; vídeo OpenCV, audio sidecar PyAV
